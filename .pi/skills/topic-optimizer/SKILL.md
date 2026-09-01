@@ -1,11 +1,16 @@
 ---
 name: topic-optimizer
-description: 理解、对齐并逐节优化工作区的 topic.md 主题纲领文件，支持单文件与目录嵌套（根纲领 + 领域纲领）两种模式，模式由项目根目录 config.json 的 topic_mode 字段声明。当用户提到 topic.md、topic 文件、主题框架、纲领文件、优化主题、填充章节/板块、精简/修订/梳理已填章节、对齐主题方向、给标题提建议、嵌套 topic.md、根 topic.md、领域 topic.md、主题地图、topic_mode、nest、singal、config.json、领域划分、作用域，或要求围绕某个主题框架文件进行阅读、建议、补充内容时，必须使用本技能——即使用户没有明确说"优化"，只要工作涉及 topic.md 或同类主题纲领文件都应触发。Use when the user mentions topic.md, topic file, topic framework, outline alignment, filling sections, refining or revising already-filled sections, optimizing their topic outline, nested topic.md, root topic.md, domain topic.md, topic map, topic_mode, nest, singal, config.json, domain partition, or topic scope.
+description: 理解、对齐并逐节优化工作区的 topic.md 主题纲领文件，支持单文件与目录嵌套（根纲领 + 领域纲领）两种模式，模式由项目根目录 config.json 的 topic_mode 字段声明；同时以只读方式参考作用域链上的 Context.md 共识库（规则/惯例、术语、极端情况、决策），Context 的创建与写入归 grill 技能。当用户提到 topic.md、topic 文件、主题框架、纲领文件、优化主题、填充章节/板块、精简/修订/梳理已填章节、对齐主题方向、给标题提建议、嵌套 topic.md、根 topic.md、领域 topic.md、主题地图、topic_mode、nest、singal、config.json、领域划分、作用域，或要求围绕某个主题框架文件进行阅读、建议、补充内容时，必须使用本技能——即使用户没有明确说"优化"，只要工作涉及 topic.md 或同类主题纲领文件都应触发；用户要求拷问、沉淀共识、记术语/规则/决策到 Context 时应转用 grill 技能而非本技能。Use when the user mentions topic.md, topic file, topic framework, outline alignment, filling sections, refining or revising already-filled sections, optimizing their topic outline, nested topic.md, root topic.md, domain topic.md, topic map, topic_mode, nest, singal, config.json, domain partition, or topic scope; consults read-only Context.md consensus files along the scope chain (Context writes belong to the grill skill).
 ---
 
 # Topic Optimizer — topic.md 理解与优化
 
-topic.md 是**主题纲领文件**：它定义主题骨架与方向，是后续一切工作的顶层依据。本技能规定 Agent 如何与用户协作：理解它、对标题提建议、逐节**填充空节或优化已有内容**——两条路径同等常规，已有内容 ≠ 已完成。
+工作区是 **Topic + Context 双文件体系**：
+
+- **Topic（主题纲领）**：topic.md（根 + 领域）定义主题骨架与方向，是后续一切工作的顶层依据，管"做什么、边界在哪"。本技能可写 Topic 正文（经确认、遵守标题主权与一节一回合）。
+- **Context（共识库）**：Context.md（根 + 领域，惰性创建）记录已确认的**规则/惯例、术语、极端情况、决策**，管"我们已商定什么"。本技能对 Context **只读**：动笔前查、起草时沿用、冲突时上报；写入权归 **grill 技能**（`skill://grill/SKILL.md`）。
+
+本技能规定 Agent 如何与用户协作：理解 topic.md、对标题提建议、逐节**填充空节或优化已有内容**——两条路径同等常规，已有内容 ≠ 已完成。
 
 ## 两种模式
 
@@ -16,6 +21,8 @@ topic.md 是**主题纲领文件**：它定义主题骨架与方向，是后续�
 
 config.json 缺失或非法时按目录结构推断并**明确告知用户**，绝不静默猜测。模式判定流程、两棵目录树示例、作用域决策流程与边界情况速查表见 `references/examples.md` 与 `references/workflow.md` 阶段 -1。config.json 由用户维护，Agent 只读不写。
 
+Context.md 与 Topic 同构嵌套：领域 Context.md 与该领域 topic.md 同目录，作用域链规则完全一致（single → 仅根 Context；nest → 根 + 领域，惰性创建）。体系总览见 `references/examples.md` 第 6 节。
+
 ## 渐进式加载
 
 1. 本文件（已加载）：硬性规则 + 工作流程骨架。
@@ -24,6 +31,7 @@ config.json 缺失或非法时按目录结构推断并**明确告知用户**，�
 4. `skill://topic-optimizer/references/examples.md` —— single/nest 两棵目录树示例、config.json 写法示例、nest 作用域决策流程、边界情况速查表。**处理 nest 模式、模式判定拿不准、或对文件结构与作用域有疑问时必读。**
 5. `skill://topic-optimizer/assets/topic-template.md` —— 仅当用户要新建 single 模式的 topic.md 或 nest 模式的根纲领文件时读。
 6. `skill://topic-optimizer/assets/domain-topic-template.md` —— 仅当用户要新建领域级 topic.md 时读。
+7. `skill://grill/references/context-format.md` —— Context.md 与决策文件的格式权威（grill 技能所有）。Context 读取、归属或冲突处理拿不准，或用户询问 Context 体系时读。
 
 ## 硬性规则（违反任何一条都是事故）
 
@@ -35,15 +43,17 @@ config.json 缺失或非法时按目录结构推断并**明确告知用户**，�
 6. **内容必须有网络搜索支撑**：动笔前先针对该节主题用 `web_search` 检索（必要时多轮），把行业事实、术语、现状融入内容；nest 下搜索词以该领域范围为界。
 7. **纲领性，不展开细节**：每节只放方向性要点（默认 3–6 条、每条一句话）。实现细节、操作步骤、穷举清单不进这个文件。粒度分两档：根纲领 = 领域级方向（更粗），领域纲领 = 子方向级要点；两档都不进实现细节。优化已填内容时以此为准绳——过细的条目应精简回方向性要点，或建议下沉到更下层文件。
 8. **作用域归属（仅 nest 有实际约束力，single 下自动满足）**：落笔对象永远是"当前选定的那一个 topic.md 中的某一个 H2"。内容疑似属于父级或子级作用域、或与其他领域重叠时，先向用户提出归属建议，得到确认后才写。禁止跨文件搬运内容。
+9. **Context 只读**：Context.md 与 decisions/ 的写入权归 grill 技能，本技能绝不创建、修改、删除。发现共识缺口、用户口述与 Context 冲突、或起草中出现候选共识（新术语/新惯例/极端情况/重要决策）→ 只提建议并指路 grill，绝不代写。
+10. **共识先查后用**：动笔前读取本文件作用域链上的全部 Context.md；起草必须沿用既有术语与规则，同一概念不得另造同义词；冲突停下指出、请用户裁决，裁决前不落笔。
 
 ## 工作流程（骨架）
 
 0. **模式判定**：读项目根目录 `config.json` 的 `topic_mode`（`"nest"` → 嵌套；`"singal"`/`"single"` → 单文件；缺失或非法 → 按结构推断并告知用户，config.json 只读不写）。详见 workflow 阶段 -1。
-1. **定位与通读**：single 按旧流程找根目录唯一文件；nest 递归收集全部 topic.md（排除隐藏/依赖目录）构建**主题地图**（文件树 + 每文件 H1/H2 概况 + 父子关系），再依据用户请求定位本次操作对象。`read` 通读目标文件，向用户复述 H1/H2 骨架、主题方向（nest 下还有本文件作用域位置），请用户确认或纠偏。
+1. **定位与通读**：single 按旧流程找根目录唯一文件；nest 递归收集全部 topic.md（排除隐藏/依赖目录）构建**主题地图**（文件树 + 每文件 H1/H2 概况 + 父子关系），再依据用户请求定位本次操作对象。`read` 通读目标文件**及作用域链上的全部 Context.md**（存在才读，不存在不建），向用户复述 H1/H2 骨架、主题方向（nest 下还有本文件作用域位置）**与既有共识概况**（各 Context 的规则/术语/极端情况/决策要点；不存在则注明「尚无 Context」），请用户确认或纠偏。
 2. **选定一节**：问用户本轮处理哪个文件哪个二级标题——空节走"填充"，已有内容的节走"优化"，两条路径同等常规；可基于通读发现（空节、方向不明、内容过细/过时、归属错位）建议优先级，但选择权在用户。
 3. **搜索**：就该节主题 `web_search`，信息不足则换关键词多轮检索。
-4. **提问对齐**：基于搜索结果，用 `ask` 就该节提出 2–4 个具体问题（nest 下含作用域归属问题）。
-5. **起草与确认**：给出该节纲领性草案（优化已有内容时须逐条标明保留/改写/新增/删除及理由），标明哪些来自搜索、哪些来自用户回答；nest 下先对照父级骨架做作用域校验，再请用户确认。
+4. **提问对齐**：基于搜索结果**与 Context 既有共识**，用 `ask` 就该节提出 2–4 个具体问题（nest 下含作用域归属问题）。
+5. **起草与确认**：给出该节纲领性草案（优化已有内容时须逐条标明保留/改写/新增/删除及理由），标明哪些来自搜索、哪些来自用户回答；起草沿用 Context 既有术语与规则，nest 下先对照父级骨架做作用域校验；起草中产生的候选共识（新术语/新惯例/极端情况/重要决策）只附清单建议 grill，不落笔；然后请用户确认。
 6. **落笔**：确认后仅用 `edit` 修改该 H2 之下的正文，标题一律不动。完成后停止，报告改动，再问下一节。
 
 ## 常见判断
@@ -60,3 +70,7 @@ config.json 缺失或非法时按目录结构推断并**明确告知用户**，�
 - 该节内容与已填内容冲突 → 停下向用户指出，不要静默改写其他节。
 - 子文件草案超出父级划定范围 → 不静默删除：指出越界，给"收敛措辞"或"更新父级文件"选项，用户裁决。
 - 父级与领域级既有内容互相矛盾 → 不静默改任何一边：指出冲突，用户裁决改哪边。
+- Context.md 不存在（根或领域） → 正常惰性状态：不代建、不预建；通读时注明「尚无 Context」；用户想建立共识 → 指路 grill 技能。
+- 用户口述/搜索结果与 Context 既有条目冲突 → 停下并列两侧说法，`ask` 用户裁决「哪个对」；裁决改 Context → 指路 grill；改 Topic → 走对应节流程。
+- 起草产生新术语/新惯例/边界情况/重要决策候选 → 不写进任何文件：草案后附「候选共识」清单，建议运行 grill 沉淀。
+- 用户直接要求改 Context.md / 记术语 / 立决策 → 不代写：给出候选文案或要点清单，指路 `/grill`。
