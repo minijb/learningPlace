@@ -24,9 +24,9 @@
 
 **阶段 3｜标准库与泛型编程：从用模板到写模板（约 2–3 周）**
 - 学习目标：把标准库用到“选型有依据、迭代器失效有戒心”，并跨过“只会用模板”到“能写带约束的模板”的门槛，理解模板是编译期代码生成机制而非运行期魔法。
-- 核心知识点：容器选型与复杂度——vector/deque/unordered_map/map 的取舍、迭代器失效规则；算法库优先于手写循环——sort/find/transform/remove-erase 惯用法；string/string_view 与 SSO；lambda 与捕获——捕获 this 悬垂、init capture；std::function 的类型擦除开销边界 vs 模板参数；模板实例化模型——为何模板定义要放头文件；类模板/函数模板、全特化与偏特化；C++20 concepts 约束写法与旧 SFINAE 对照；constexpr/consteval 编译期计算；常用 type traits；变参模板与折叠表达式初步；CRTP 静态多态概念级（引擎代码常见形状）。
-- 实践任务：为渲染器写泛型 ResourceManager<Key, Value, Loader>（加载/缓存/去重/句柄化），用 concepts 约束 Loader 接口；把第 2 节数学库模板化，float/double 双精度同一套测试；用标准算法替换渲染器中至少三处手写循环。
-- 检验标准：能口述模板从实例化到生成代码的过程并解释头文件依赖成因；给出同一段参数约束的 SFINAE 与 concepts 两版实现并说明可读性收益；ResourceManager 同时管理纹理与着色器两类资源而核心逻辑零复制；能说出 std::function 相比模板参数的性能代价与各自适用边界。
+- 核心知识点：容器选型与复杂度——vector/deque/unordered_map/map 的取舍、迭代器失效规则；算法库优先于手写循环——sort/find/transform/remove-erase 惯用法；string/string_view 与 SSO；lambda 与捕获——捕获 this 悬垂、init capture；std::function 的类型擦除开销边界 vs 模板参数；可调用对象全景——函数指针/lambda/仿函数/std::function/std::bind 的用法与关系：std::function 存储任意可调用物的类型擦除机制（可能堆分配、调用间接开销）；std::bind 作为工具——占位符 _1/_2、std::ref/cref 引用绑定、绑定成员函数与重载消歧、嵌套 bind，及 lambda/std::bind_front 等价对照与业界使用倾向（EMC++ 条 34、abseil Tip #108）；std::invoke 统一调用语法；词汇类型——std::optional 可空值替代哨兵/魔法值、std::variant 和一类型与 visit 匹配（游戏状态机经典用法，联动第 4 节状态模式）、std::any 真动态类型的窄用途、std::span 非拥有连续视图作为数组传参默认姿势（呼应阶段 2 借用词汇表）；C++23 前瞻注记——std::expected 与 ranges/coroutines 的存在与归属（错误处理策略见阶段 7），基线外不展开；模板实例化模型——为何模板定义要放头文件；类模板/函数模板、全特化与偏特化；C++20 concepts 约束写法与旧 SFINAE 对照；constexpr/consteval 编译期计算；常用 type traits；变参模板与折叠表达式初步；CRTP 静态多态概念级（引擎代码常见形状）。
+- 实践任务：为渲染器写泛型 ResourceManager<Key, Value, Loader>（加载/缓存/去重/句柄化），用 concepts 约束 Loader 接口；把第 2 节数学库模板化，float/double 双精度同一套测试；用标准算法替换渲染器中至少三处手写循环；用 std::variant+std::visit 实现游戏状态机小样（如 待机/移动/攻击 三态，为第 4 节状态模式埋点），并各写一版 std::function 与模板参数的回调调用点，注释标出类型擦除发生在哪里。
+- 检验标准：能口述模板从实例化到生成代码的过程并解释头文件依赖成因；给出同一段参数约束的 SFINAE 与 concepts 两版实现并说明可读性收益；ResourceManager 同时管理纹理与着色器两类资源而核心逻辑零复制；能说出 std::function 相比模板参数的性能代价与各自适用边界；能用 std::bind 写出含占位符与 std::ref 的绑定并给出等价 lambda 写法；能为「可能没有值 / 有限集合选一 / 任意类型」分别选出 optional/variant/any，并说明 span 为何是连续数据传参的默认姿势。
 
 **阶段 4｜工具链工程化：CMake 构建体系（约 1–2 周）**
 - 学习目标：摆脱 IDE 一键工程的黑盒，能用现代 CMake 组织中型项目、接入第三方库与测试，产出可交接的构建工程——第 6 节阶段 1“用 CMake 搭建项目（复用第 1 节工具链）”在此直接兑现。
