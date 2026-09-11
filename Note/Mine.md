@@ -36,3 +36,238 @@
 > 问自己：「这个类是否**直接拥有**一块需要手动释放的资源？」
 > ——否（成员全是 string/vector/纯数据）：**rule of zero**，一行都不写。
 > ——是（类里躺着裸指针/裸句柄）：**rule of five**，五件套齐全，移动操作记得标 `noexcept`。
+
+
+
+## shared_ptr 的多线程安全
+
+1. 计数 是原子的 因此 计数是安全的
+2. 但是操作并不保证安全， 可能出现线程竞争
+
+
+
+```cpp
+// ch02_atomic_vs_safe.cpp —— 引用计数的原子性 ≠ 对象本身的线程安全（完整可编译）
+// clang++ -std=c++20 -Wall -Wextra -pthread ch02_atomic_vs_safe.cpp -o ch02_atomic_vs_safe
+// 案子 B 故意制造数据竞争（未定义行为）作教学演示；工程上请用第 5 章的同步手段。
+#include <cstdio>
+#include <memory>
+#include <thread>
+#include <vector>
+
+class AudioMixer {
+public:
+    int masterVolume = 0;   // 演示用：普通 int，没有任何保护
+};
+
+int main() {
+    constexpr int kThreads    = 4;
+    constexpr int kIterations = 100000;
+
+    std::printf("== A. 控制块计数是原子的：多线程拷贝/销毁不丢计数 ==\n");
+    auto mixer = std::make_shared<AudioMixer>();
+    {
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t)
+            threads.emplace_back([&mixer] {
+                for (int i = 0; i < kIterations; ++i) {
+                    std::shared_ptr<AudioMixer> local = mixer;  // 原子 ++
+                    // ……假装在用混音器……
+                }   // local 析构：原子 --
+            });
+        for (auto& th : threads) th.join();
+    }
+    std::printf("  %d 个线程各拷贝/销毁 %d 次后：use_count = %ld（精确回到 1）\n",
+                kThreads, kIterations, static_cast<long>(mixer.use_count()));
+
+    std::printf("== B. 对象本身毫无保护：并发写普通成员 = 数据竞争 ==\n");
+    {
+        std::vector<std::thread> writers;
+        for (int t = 0; t < kThreads; ++t)
+            writers.emplace_back([&mixer] {
+                for (int i = 0; i < kIterations; ++i)
+                    mixer->masterVolume = mixer->masterVolume + 1;  // 读-改-写，非原子
+            });
+        for (auto& th : writers) th.join();
+    }
+    std::printf("  期望 masterVolume = %d，实际 = %d（丢失更新）\n",
+                kThreads * kIterations, mixer->masterVolume);
+    std::printf("  结论：shared_ptr 管的只是「谁负责销毁」；对象成员的同步它一概不管\n");
+    std::printf("        （数据竞争的本质与治理将在第 5 章展开）\n");
+    return 0;
+}
+```
+
+
+
+简单来说就是， shareptr 只管谁来销毁， 操作如何同步是不进行管理的
+
+## shared_ptr 的坑
+
+enable_shared_from_this 与 lambda 捕获 this：两类「回身取自己」的坑。 自己取自己。
+
+**坑一：在成员函数里给自己开 `shared_ptr`。** 异步系统常见需求：`Fireball` 的成员函数要把「自己」交给调度器/音频系统暂存。新手的写法 `std::shared_ptr<Fireball>(this)` 看似顺理成章，实则**给同一个对象开出了第二张控制块**——新旧两批属主各记各的账，最后各销各的，**双重释放**。正确姿势：类继承 `std::enable_shared_from_this<Fireball>`，成员函数里调 `shared_from_this()`——它复用**出生时预埋**的那张控制块，只是计数 +1。前提要记牢：**对象必须已经被 `shared_ptr` 接管**（通常是刚 `make_shared` 出来的），否则 C++17 起 `shared_from_this()` 抛 `std::bad_weak_ptr`。
+
+**坑二：lambda 捕获 `this`。** `[this]` 捕获的是裸指针——它**不会**让对象多活一纳秒。回调登记时对象还活着，执行时对象可能早死了：这就是第 1 章 1.11 节 HUD 悬垂崩溃的「异步回调」翻版，而且更隐蔽，因为崩溃点在回调执行处，离注册处隔着一整个事件循环。修复套路与坑一同源：**类继承 `enable_shared_from_this`，回调里捕获 `weak_from_this()`，执行时 `lock()`**——活着就干，死了安全跳过。lambda 捕获的完整机制（按值/按引用/init capture）将在第 3 章展开，这里先掌握这个保命组合拳。
+
+```cpp
+// ch02_shared_from_this.cpp —— enable_shared_from_this 与 lambda 捕获 this 的悬垂（完整可编译）
+// clang++ -std=c++20 -Wall -Wextra ch02_shared_from_this.cpp -o ch02_shared_from_this
+#include <cassert>
+#include <cstdio>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+// 极简「延时回调」调度器：收集 lambda，等「下一帧」再统一执行
+class Scheduler {
+public:
+    void post(std::function<void()> job) { jobs_.push_back(std::move(job)); }
+    void runAll() {
+        for (auto& job : jobs_) job();
+        jobs_.clear();
+    }
+private:
+    std::vector<std::function<void()>> jobs_;
+};
+
+// 正面教材：继承 enable_shared_from_this，回调里攥 weak_ptr 而不是裸 this
+class Fireball : public std::enable_shared_from_this<Fireball> {
+public:
+    explicit Fireball(std::string caster) : caster_(std::move(caster)) {
+        std::printf("  [构造] Fireball(%s 施放)\n", caster_.c_str());
+    }
+    ~Fireball() { std::printf("  [析构] Fireball(%s 施放)\n", caster_.c_str()); }
+
+    // 场景一：成员函数内部要把「自己的 shared_ptr」交给异步系统（常见需求）
+    std::shared_ptr<Fireball> self() {
+        // 错误姿势：return std::shared_ptr<Fireball>(this);
+        //   —— 给同一个对象开出第二张控制块，两批属主互不知情 → 双重释放
+        return shared_from_this();   // ✅ 复用同一张控制块，只是计数 +1
+    }
+
+    // 场景二：把回调挂到调度器。回调晚于对象销毁执行，是游戏异步代码的常态
+    void scheduleReport(Scheduler& sched) {
+        std::weak_ptr<Fireball> weakSelf = weak_from_this();   // C++17 起
+        sched.post([weakSelf] {
+            if (std::shared_ptr<Fireball> self = weakSelf.lock()) {
+                std::printf("  [回调] 火球还活着：%s 的火球命中\n", self->caster_.c_str());
+            } else {
+                std::printf("  [回调] 火球已销毁，安全跳过（没有悬垂访问）\n");
+            }
+        });
+    }
+
+private:
+    std::string caster_;
+};
+
+// 反面教材：直接捕获 this —— 对象一死，回调里就是悬垂指针（第 1 章 HUD 崩溃的翻版）
+class Trap {
+public:
+    void scheduleReport(Scheduler& sched) {
+        sched.post([this] {   // ⚠ 捕获裸 this：它不会让对象多活一纳秒
+            (void)this;   // 演示刻意不碰成员（避免未定义行为直接炸掉示例）；真实代码已在访问已释放内存
+            std::printf("  [回调] Trap 还在（本例没碰成员所以没崩；真实代码已在使用已释放内存）\n");
+        });
+    }
+};
+
+int main() {
+    std::printf("== 1. shared_from_this：成员函数里拿「自己的」shared_ptr ==\n");
+    std::shared_ptr<Fireball> fire = std::make_shared<Fireball>("法师");
+    std::shared_ptr<Fireball> alsoFire = fire->self();
+    assert(fire == alsoFire);
+    std::printf("  use_count = %ld（同一对象、同一控制块，多了一个属主）\n",
+                static_cast<long>(fire.use_count()));
+
+    std::printf("== 2. 回调晚于销毁：weak_from_this 版安全跳过 ==\n");
+    {
+        Scheduler sched;
+        {
+            auto temp = std::make_shared<Fireball>("学徒");
+            temp->scheduleReport(sched);
+        }                  // 学徒的火球在这里析构
+        sched.runAll();    // 「下一帧」回调才执行
+    }
+
+    std::printf("== 3. 对照：捕获 this 的版本（对象已死，回调还攥着 this）==\n");
+    {
+        Scheduler sched;
+        {
+            auto trap = std::make_unique<Trap>();
+            trap->scheduleReport(sched);
+        }
+        sched.runAll();    // this 已悬垂——真实工程中这里就是第 1 章 1.11 的崩溃现场
+    }
+    std::printf("== 程序结束 ==\n");
+    return 0;
+}
+```
+
+
+
+一句工程忠告：**异步回调的默认姿势就是「捕获 weak，lock 再用」**。凡是你把成员函数（或 lambda）登记给队列、定时器、事件总线、网络层的地方，都值得问一句：「执行的时候，this 还活着吗？谁保证？」
+
+一般都不使用 shared_ptr 在异步中进行回调。
+
+## 所有权
+
+
+
+**拥有（ownership）**：对资源的生死负责，负责释放。表达方式：值成员、`std::unique_ptr`（独占）、`std::shared_ptr`（共享）、容器（拥有其元素）。
+
+**借用（borrowing）**：临时访问，不负责生死，**绝不释放**。表达方式：`T&` / `const T&`（非空借用）、`T*` / `const T*`（可空借用，仅作观察者，**永不 `delete`**）、`std::span<const T>`（借一段连续数据）、`std::string_view`（借一段字符串）。后两者是 C++20 / C++17 的词汇类型，借而不拥有是它们存在的全部意义（选型细节将在第 3 章展开；引擎停留在 C++17 时，`span` 可用「指针 + 长度」参数或 gsl::span 平替）。
+
+
+
+| 意图                 | 接口形状                                 | 生存期责任                        |
+| -------------------- | ---------------------------------------- | --------------------------------- |
+| 「给我，归你管」     | `void install(std::unique_ptr<Mesh> m)`  | 调用方移交，被调方拥有并负责释放  |
+| 「我们一起保它活着」 | `void bind(std::shared_ptr<Audio> a)`    | 共享所有权，最后一个属主收尾      |
+| 「我用一下，别销毁」 | `void draw(const Mesh& m)`               | 调用窗口内有效，双方心照不宣      |
+| 「看一眼，可能没有」 | `const Mesh* find(...)`                  | 同上，且可为空；永不 delete       |
+| 「借这一段数据」     | `void update(std::span<const float> uv)` | 语句级借用，不存储                |
+| 「借这个名字」       | `void rename(std::string_view n)`        | 同上；要保存就拷进自己的 `string` |
+
+借用的全部风险浓缩成一句话：**借用不延长生存期**。`string_view` 绑了临时 `string`，语句结束就是悬垂（第 1 章 HUD 教训的所有权版）；`span` 绑了临时 `vector`，同理。规则：借用只活在「当前调用」或文档明确标注的窗口内；要过夜，请拥有（拷贝 / 移入容器 / 智能指针）：
+
+
+
+## string_view
+
+- **消除拷贝开销**：传统函数如 `void foo(const std::string& s)` 在传入 C 风格字符串时，会隐式构造临时 `std::string` 并分配堆内存；而 `void foo(std::string_view s)` 只是复制两个整数（指针和长度），**绝对零堆分配**。
+- **统一接口**：它可以无缝接受 `std::string`、`char*`、`const char*` 甚至是 `std::string` 的子串（`substr` 返回视图本身也是零拷贝，不像 `std::string::substr` 会复制新字符串）。
+
+
+
+## make_shared 为什么比 new shared_ptr 更加好
+
+
+
+```text
+写法一：shared_ptr<T>(new T)  ——  两次分配，两处住
+  ┌─────────────────┐        ┌──────────────────────────┐
+  │ T 对象           │        │ 控制块                    │
+  │  (你的数据)      │◀──ptr──│ 强计数 │ 弱计数 │ deleter │
+  └─────────────────┘        └──────────────────────────┘
+  分配 #1（new T）              分配 #2（控制块）
+  强计数归零：T 析构 + #1 释放
+  弱计数归零：#2 释放
+
+写法二：make_shared<T>()  ——  一次分配，一块住
+  ┌───────────────────────────────────┐
+  │ 控制块            │  T 对象         │
+  │ 强计数 │ 弱计数 … │  (紧挨控制块)    │
+  └───────────────────────────────────┘
+  分配 #1（合并块：控制块 + 对象）
+  强计数归零：T 析构（内存不还！弱计数还钉着）
+  弱计数归零：整块 #1 释放
+```
+
+`make_shared` 的红利一目了然：省一次堆分配（分配是有成本的，成本细账第 6 章展开），且对象与控制块相邻，拷贝 `shared_ptr` 要摸的控制块大概率还在缓存里——缓存局部性红利。
+
+
+
