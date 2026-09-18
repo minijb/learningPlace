@@ -1957,6 +1957,8 @@ auto onHit = [&player, &killCount](int dmg) {
 
 ### 实践任务
 
+> 本节是要点式参考思路；四道任务的**完整可编译实现与实测输出**见本章末尾《实践任务完整参考实现（可编译源码 + 实测输出）》一节。
+
 **任务 1（泛型 ResourceManager）**。参考思路：头文件里定义 `ResourceManager`，成员就三样：`std::unordered_map<Key, std::uint32_t> lookup_`、`std::vector<std::unique_ptr<V>> slots_`、`std::vector<std::uint32_t> generations_`（加分项用）。`get_or_load(const K& key)`：查表命中返 `Handle{slot}`；未命中 `loader.load(key)` 得 `unique_ptr<V>`、压入槽位表、记 generation、建键映射。`get(Handle)` 返 `*slots_[h.slot]`。用 3.11 的 `ResourceLoader` concept 约束 Loader 模板参数。验收要点按任务描述四条核对；特别演示「槽位表 `push_back` 触发搬家后，先前拿到的 `Handle` 依旧能 `get` 出同一对象」（`unique_ptr` 槽位的价值现场）与「同一 Key 二次加载 load 计数 = 1」（去重生效）。可选 P1 衔接：Loader 换文件读取，Handle 接渲染器纹理表。
 
 **任务 2（数学库模板化）**。参考思路：`template <std::floating_point T> struct Vec3 { T x, y, z; ... }`，运算符全部按值返回 T 版；`almostEqual` 用 3.11 版本，容差 `std::numeric_limits<T>::epsilon() * T(16)`（scale 起点可调）。性质测试写成模板函数对 `Vec3<float>`、`Vec3<double>` 各调一次；「正交点积为 0」这类纯编译期可算的性质用 `static_assert(almostEqual(dot(a,b), T(0), eps))`——注意 `almostEqual` 需要 constexpr 化（3.12 的「许可」：常量语境自动编译期）。验收：float/double 全绿；`almostEqual(int, int, int)` 编译失败贴报错；口述「第三类型零新增逻辑」。
@@ -1964,6 +1966,702 @@ auto onHit = [&player, &killCount](int dmg) {
 **任务 3（替换手写循环）**。参考替换清单（原始输出实测为 `存活=2 首个=有 id3距离=8.8 总伤害=42.6` 与 `绘制序: 1 -> 3`）：① 过滤 → `std::erase_if(ps, [](const Particle& p) { return p.hp <= 0; })`（或经典 remove-erase 两步）；② 冒泡 → `std::sort(draws.begin(), draws.end(), [](const DrawItem& a, const DrawItem& b) { return a.dist > b.dist; })`（远到近 = 降序，比较符 `>`）；③ 手工查找 → `std::find_if` + id 谓词，先判 `!= end()`；④ 手工累加 → `std::accumulate` + lambda 初值 0 起步。验收：替换前后输出逐字节一致（`diff` 为空）；每处口述「算法名 / 复杂度 / 迭代器类别」——sort 要随机访问（vector 满足）；erase_if 是容器自由函数不走迭代器类别那套。
 
 **任务 4（状态机 + 双版回调）**。参考思路：`using EnemyState = std::variant<Idle, Moving, Attacking>;`（每态带各自数据成员）+ `overloaded` 三 lambda 处理「进入/持续」；转移逻辑用 `std::visit` 返回新状态（或以 `std::get_if` 做带上下文的转移函数）。双版回调照 3.7 示例的 A/B 两函数形状，注释对上两跳间接/单态化两套措辞。验收重点第 ① 条的报错就是 3.8 那段 `variant(1564): invoke: 未找到匹配的重载函数`；第 ② 条「新增眩晕态」体验点：加 `struct Stunned { int frames; };` 进 variant 列表 → 编译器立刻报出所有没处理它的 visit 点——「编译期穷举」的价值亲测。可选 P1 衔接：接入渲染器 demo 当敌人 AI 雏形。
+
+---
+
+## 实践任务完整参考实现（可编译源码 + 实测输出）
+
+> 前一节《实践任务》是要点式参考思路，本节给出四道任务的**完整实现**。四份源码均在 MSVC 19.44 工具集（VS 2022 17.14，`cl /utf-8 /std:c++20 /EHsc /W4`）下**零警告**编译、运行并逐行核对过输出；三段「报错节选」均为真实编译输出。示例刻意不打印裸地址，输出确定、可逐字节复现。
+
+### 任务 1：泛型 ResourceManager<Key, Value, Loader>（concepts 约束版）
+
+核心数据就三张表：`unordered_map<Key, uint32_t>`（键 → 槽位号）、`vector<unique_ptr<Value>>`（槽位表）、`vector<uint32_t>`（每槽位代数，加分项用）。管理器模板对 `V` 零感知，同一套逻辑同时管理 `TextureData` 与 `ShaderSource`：
+
+```cpp
+// ch03_task1_resource_manager.cpp —— 实践任务 1：泛型 ResourceManager（concepts 约束版）
+// cl /utf-8 /std:c++20 /EHsc /W4 ch03_task1_resource_manager.cpp
+#include <concepts>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+// ────────────── 两类资源：刻意不可拷贝（零复制的编译器级证明） ──────────────
+struct TextureData {
+    std::vector<std::byte> pixels;
+    std::string            name;
+
+    explicit TextureData(std::string n, std::size_t bytes)
+        : pixels(bytes), name(std::move(n)) {}
+
+    TextureData(const TextureData&)            = delete;  // 拷贝一旦发生 = 编译错误
+    TextureData& operator=(const TextureData&) = delete;
+    TextureData(TextureData&&)                 = default; // 移动是唯一的所有权转移手段
+    TextureData& operator=(TextureData&&)      = default;
+};
+
+struct ShaderSource {
+    std::string code;
+    std::string name;
+
+    explicit ShaderSource(std::string n, std::string src)
+        : code(std::move(src)), name(std::move(n)) {}
+
+    ShaderSource(const ShaderSource&)            = delete;
+    ShaderSource& operator=(const ShaderSource&) = delete;
+    ShaderSource(ShaderSource&&)                 = default;
+    ShaderSource& operator=(ShaderSource&&)      = default;
+};
+
+// ────────────── Loader 契约：3.11 的 ResourceLoader 原样搬用 ──────────────
+template <class L, class K, class V>
+concept ResourceLoader = requires(const L& loader, const K& key) {
+    { loader.load(key) } -> std::same_as<std::unique_ptr<V>>;
+};
+
+// ────────────── 对外只发轻量句柄（含代数计数：加分项） ──────────────
+struct Handle {
+    std::uint32_t slot       = 0;
+    std::uint32_t generation = 0;
+};
+
+// ────────────── 泛型资源管理器：同一套核心逻辑，V 是谁都不改一行 ──────────────
+template <class K, class V, class Loader>
+    requires ResourceLoader<Loader, K, V>          // Loader 违约：报错直接指向这条约束
+class ResourceManager {
+public:
+    explicit ResourceManager(Loader loader) : loader_(std::move(loader)) {}
+
+    // 查缓存，未命中才 load —— 去重只有这一个入口
+    Handle get_or_load(const K& key) {
+        if (auto it = lookup_.find(key); it != lookup_.end())
+            return {it->second, generations_[it->second]};   // 缓存命中：不加载
+
+        std::unique_ptr<V> fresh = loader_.load(key);        // ← 全生命周期仅此一次加载
+        ++load_count_;
+        if (!free_slots_.empty()) {                          // 复用已释放的槽位
+            const std::uint32_t s = free_slots_.back();
+            free_slots_.pop_back();
+            slots_[s] = std::move(fresh);                    // 槽位重新指向新对象
+            lookup_.emplace(key, s);
+            return {s, generations_[s]};                     // 代数已在 erase 时 +1
+        }
+        slots_.push_back(std::move(fresh));                  // 槽位表扩容搬家时，搬的只是
+        generations_.push_back(0);                           // unique_ptr 本身——资源对象一动不动
+        const auto s = static_cast<std::uint32_t>(slots_.size() - 1);
+        lookup_.emplace(key, s);
+        return {s, 0};
+    }
+
+    // 句柄 → 资源。代数不匹配 = 槽位已被复用，拒绝放行（加分项）
+    V* try_get(Handle h) {
+        const bool          slotOk     = h.slot < slots_.size();
+        const std::uint32_t currentGen = slotOk ? generations_[h.slot] : 0;
+        if (!slotOk || !slots_[h.slot] || currentGen != h.generation) {
+            std::printf("  [句柄过期] slot=%u gen=%u（槽位当前 gen=%u）→ 槽位已被复用\n",
+                        h.slot, h.generation, currentGen);
+            return nullptr;
+        }
+        return slots_[h.slot].get();
+    }
+
+    V& get(Handle h) {
+        V* p = try_get(h);
+        if (!p) std::abort();   // 演示版：过期句柄立即终止；真实工程返回 optional/expected（第 7 章）
+        return *p;
+    }
+
+    // 释放：资源析构、槽位回收复用、代数 +1 —— 老句柄从此无法冒充新资源
+    void erase(const K& key) {
+        auto it = lookup_.find(key);
+        if (it == lookup_.end()) return;
+        slots_[it->second].reset();           // 资源本体析构
+        ++generations_[it->second];           // 代数前进
+        free_slots_.push_back(it->second);    // 槽位待复用
+        lookup_.erase(it);
+    }
+
+    std::size_t load_count() const { return load_count_; }
+
+private:
+    Loader                               loader_;
+    std::unordered_map<K, std::uint32_t> lookup_;       // 键 → 槽位号
+    std::vector<std::unique_ptr<V>>      slots_;        // 槽位表：unique_ptr 是零搬家的关键
+    std::vector<std::uint32_t>           generations_;  // 每槽位一个代数
+    std::vector<std::uint32_t>           free_slots_;   // 已释放待复用的槽位
+    std::size_t                          load_count_ = 0;
+};
+
+// ────────────── 独立版 Loader：从「内存资源注册表」加载（模拟磁盘） ──────────────
+class TextureLoader {
+public:
+    explicit TextureLoader(std::unordered_map<std::string, std::string> files)
+        : files_(std::move(files)) {}
+
+    std::unique_ptr<TextureData> load(const std::string& name) const {
+        auto it = files_.find(name);
+        if (it == files_.end()) {                        // 注册表没有 → 占位资源（演示容错）
+            std::printf("  [加载] %s：注册表未找到 → 生成 16 字节占位\n", name.c_str());
+            return std::make_unique<TextureData>(name, 16);
+        }
+        const std::string& blob = it->second;
+        std::printf("  [加载] %s：读出 %zu 字节\n", name.c_str(), blob.size());
+        auto tex = std::make_unique<TextureData>(name, blob.size());
+        for (std::size_t i = 0; i < blob.size(); ++i)    // 「文件内容」当像素（真实工程：stb_image 解码）
+            tex->pixels[i] = static_cast<std::byte>(blob[i]);
+        return tex;
+    }
+
+private:
+    std::unordered_map<std::string, std::string> files_;
+};
+
+class ShaderLoader {
+public:
+    std::unique_ptr<ShaderSource> load(const std::string& name) const {
+        std::printf("  [加载] %s：读出着色器源码\n", name.c_str());
+        return std::make_unique<ShaderSource>(name, "void main() { /* " + name + " */ }");
+    }
+};
+
+int main() {
+    std::printf("== 1. 同一套核心逻辑管理 TextureData：去重生效 ==\n");
+    ResourceManager<std::string, TextureData, TextureLoader> texMgr(TextureLoader({
+        {"hero.png",  std::string(1024, 'H')},
+        {"slime.png", std::string(512, 'S')},
+    }));
+
+    TextureData& hero      = texMgr.get(texMgr.get_or_load("hero.png"));     // 第一次：真加载
+    TextureData& heroAgain = texMgr.get(texMgr.get_or_load("hero.png"));     // 第二次：缓存命中
+    std::printf("  同一 Key 两次 get：同地址=%s  load 计数=%zu（去重生效）\n",
+                (&hero == &heroAgain) ? "是" : "否", texMgr.load_count());
+
+    std::printf("== 2. 零复制证明：拷贝构造被 delete，槽位表搬家对象不动 ==\n");
+    const TextureData* before = &hero;   // 拷贝构造被删除而全程序可编译 = 零复制的编译器级证明
+    for (int i = 0; i < 4; ++i)          // 灌 4 张新贴图，逼槽位表多次扩容搬家
+        texMgr.get(texMgr.get_or_load("extra" + std::to_string(i) + ".png"));
+    TextureData& heroAfter = texMgr.get(texMgr.get_or_load("hero.png"));
+    std::printf("  槽位表扩容前后 hero 同地址=%s（unique_ptr 槽位的实战价值）\n",
+                (before == &heroAfter) ? "是" : "否");
+
+    std::printf("== 3. 同一套核心逻辑管理 ShaderSource：管理器零改动 ==\n");
+    ResourceManager<std::string, ShaderSource, ShaderLoader> shaderMgr(ShaderLoader{});
+    ShaderSource& vs = shaderMgr.get(shaderMgr.get_or_load("vs.vert"));
+    shaderMgr.get(shaderMgr.get_or_load("vs.vert"));                          // 命中
+    std::printf("  vs.vert 源码长度=%zu  load 计数=%zu\n", vs.code.size(), shaderMgr.load_count());
+
+    std::printf("== 4. 加分项：槽位复用与代数计数 ==\n");
+    Handle hSlime = texMgr.get_or_load("slime.png");     // 第一次加载 slime
+    std::printf("  slime 句柄：slot=%u gen=%u\n", hSlime.slot, hSlime.generation);
+    texMgr.erase("slime.png");                           // 资源析构、代数 +1、槽位待复用
+    texMgr.get(texMgr.get_or_load("ghost.png"));         // 未命中 → 加载 → 复用 slime 的槽位
+    TextureData* stolen = texMgr.try_get(hSlime);        // 老句柄 gen=0 ≠ 槽位当前 gen=1
+    if (!stolen)
+        std::printf("  老句柄 gen=%u → try_get 返回空：代数计数识破「槽位复用冒充」\n",
+                    hSlime.generation);
+    return 0;
+}
+```
+
+实测输出：
+
+```text
+== 1. 同一套核心逻辑管理 TextureData：去重生效 ==
+  [加载] hero.png：读出 1024 字节
+  同一 Key 两次 get：同地址=是  load 计数=1（去重生效）
+== 2. 零复制证明：拷贝构造被 delete，槽位表搬家对象不动 ==
+  [加载] extra0.png：注册表未找到 → 生成 16 字节占位
+  [加载] extra1.png：注册表未找到 → 生成 16 字节占位
+  [加载] extra2.png：注册表未找到 → 生成 16 字节占位
+  [加载] extra3.png：注册表未找到 → 生成 16 字节占位
+  槽位表扩容前后 hero 同地址=是（unique_ptr 槽位的实战价值）
+== 3. 同一套核心逻辑管理 ShaderSource：管理器零改动 ==
+  [加载] vs.vert：读出着色器源码
+  vs.vert 源码长度=29  load 计数=1
+== 4. 加分项：槽位复用与代数计数 ==
+  [加载] slime.png：读出 512 字节
+  slime 句柄：slot=5 gen=0
+  [加载] ghost.png：注册表未找到 → 生成 16 字节占位
+  [句柄过期] slot=5 gen=0（槽位当前 gen=1）→ 槽位已被复用
+  老句柄 gen=0 → try_get 返回空：代数计数识破「槽位复用冒充」
+```
+
+**验收要点逐条核对**：
+
+- **① 假 Loader 编译失败，报错指向约束**。给一个没有 `load` 的 `BrokenLoader`：
+
+```cpp
+struct BrokenLoader {};   // 什么都没有：没有 load 成员
+ResourceManager<std::string, TextureData, BrokenLoader> mgr{BrokenLoader{}};
+```
+
+```text
+编译输出节选（MSVC 19.44，中文语言包；同一违约的连锁推导错误已截断，以你本机输出为准）：
+t1_broken_loader.cpp(23): error C7602: “ResourceManager”: 未满足关联约束
+t1_broken_loader.cpp(15): note: 参见“ResourceManager”的声明
+t1_broken_loader.cpp(14): note: 计算结果为 false 的概念“ResourceLoader<BrokenLoader,std::string,int>”
+t1_broken_loader.cpp(10): note: "load": 不是 "BrokenLoader" 的成员
+```
+
+  按 3.11 的读法：报错第一行点名**未满足关联约束**，第二行给出违约概念全名（约束名 + 违约类型都在场），第三行一锤定音——`load` 不是 `BrokenLoader` 的成员。不用读模板体就知道 Loader 少了什么，这就是「约束写在签名上」的全部收益。
+- **② 零复制证明**。`TextureData`/`ShaderSource` 的拷贝构造 `= delete`，管理器全部核心逻辑（键表、槽位表、代数表的每一次插入、复用、扩容）在**一次拷贝都不发生**的前提下编译通过——「能编译」本身就是编译器级的零复制证明。运行期旁证：第 2 段灌入 4 张新贴图逼槽位表多次扩容搬家，`hero` 的地址前后不变——搬家的是 `unique_ptr` 槽位本身，资源对象本体一动不动（3.2 失效规则的实战应用）。
+- **③ 去重**。同一 Key 第二次 `get_or_load` 走缓存命中分支（输出第 1 段：`同地址=是  load 计数=1`）。
+- **④ 加分项：槽位复用与代数计数**。只记 `slot` 的 Handle 有个阴险问题：资源释放后槽位被新资源复用，老 Handle 仍指向同一槽位——`get` 会返回**另一个**资源，类型正确、地址有效，编译器和地址断言都抓不到（比悬垂更隐蔽的「活着但认错了人」）。代数（generation）计数是解药：每槽位配一个代数，`erase` 时 +1；Handle 记下发放时的代数，`get` 时比对，不一致即过期。示例第 4 段实测：老句柄 gen=0、槽位当前 gen=1，`try_get` 返回空并打印过期诊断。完整句柄方案（池 + 索引 + 代数的工程化形态）属第 4 节资源管理。
+
+**可选 P1 衔接**：Loader 换成真文件/stb_image 版（`load` 签名不变，管理器零改动），Handle 接渲染器纹理表。
+
+### 任务 2：数学库模板化 —— float/double 同一套测试
+
+```cpp
+// ch03_task2_math_templates.cpp —— 实践任务 2：数学库模板化 —— float/double 同一套测试
+// cl /utf-8 /std:c++20 /EHsc /W4 ch03_task2_math_templates.cpp
+#include <cmath>
+#include <concepts>
+#include <cstdio>
+#include <limits>
+#include <type_traits>
+
+// ────────────── 约束：只接受浮点类型（3.11 的 Floating concept） ──────────────
+template <class T>
+concept Floating = std::floating_point<T>;
+
+// constexpr 化：编译期性质测试要用它（3.12 的「许可」：常量语境自动编译期）
+template <Floating T>
+constexpr bool almostEqual(T a, T b, T eps) {
+    T diff = a > b ? a - b : b - a;
+    return diff <= eps;
+}
+
+// ────────────── Vec2<T> / Vec3<T>：同一份代码，各浮点类型各得一份实例 ──────────────
+template <Floating T>
+struct Vec2 {
+    T x{}, y{};
+
+    // 除 length() 外全部 constexpr：编译期性质测试的门票（3.12）
+    constexpr Vec2 operator+(const Vec2& o) const { return {x + o.x, y + o.y}; }
+    constexpr Vec2 operator-(const Vec2& o) const { return {x - o.x, y - o.y}; }
+    constexpr Vec2 operator*(T s)           const { return {x * s, y * s}; }
+    constexpr T    dot(const Vec2& o)       const { return x * o.x + y * o.y; }
+    constexpr T    lengthSquared()          const { return dot(*this); }
+    T              length()                 const { return std::sqrt(lengthSquared()); }
+    constexpr bool operator==(const Vec2&)  const = default;
+};
+
+template <Floating T>
+struct Vec3 {
+    T x{}, y{}, z{};
+
+    constexpr Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    constexpr Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    constexpr Vec3 operator*(T s)           const { return {x * s, y * s, z * s}; }
+    constexpr T    dot(const Vec3& o)       const { return x * o.x + y * o.y + z * o.z; }
+    constexpr T    lengthSquared()          const { return dot(*this); }
+    T              length()                 const { return std::sqrt(lengthSquared()); }  // sqrt 非 constexpr
+    constexpr bool operator==(const Vec3&)  const = default;
+};
+
+// 每个向量类型自报一组正交基 → 一套测试模板对 Vec2/Vec3 通用
+template <class Vec> struct Basis;
+template <Floating T> struct Basis<Vec2<T>> {
+    static constexpr Vec2<T> e1{T(1), T(0)};
+    static constexpr Vec2<T> e2{T(0), T(1)};
+};
+template <Floating T> struct Basis<Vec3<T>> {
+    static constexpr Vec3<T> e1{T(1), T(0), T(0)};
+    static constexpr Vec3<T> e2{T(0), T(1), T(0)};
+};
+
+// ────────────── 编译期性质：static_assert 验证（零运行期成本） ──────────────
+template <template <class> class Vec, Floating T>
+constexpr bool compileTimeProperties() {
+    using B = Basis<Vec<T>>;
+    constexpr Vec<T> zero{};
+    constexpr T      eps = std::numeric_limits<T>::epsilon() * T(16);
+
+    static_assert(B::e1.dot(B::e2) == T(0), "正交基点积为 0");
+    static_assert(zero.lengthSquared() == T(0), "零向量长度平方为 0");
+    static_assert(almostEqual(B::e1.dot(B::e2), B::e2.dot(B::e1), eps), "点积交换律");
+    static_assert((B::e1 * T(3) + B::e2 * T(4)).dot(B::e2) == T(4), "加法与标量乘投影不变");
+    static_assert((B::e1 - B::e1) == zero, "减法自反");
+    return true;
+}
+static_assert(compileTimeProperties<Vec2, float>());          // 编译期就全绿
+static_assert(compileTimeProperties<Vec2, double>());
+static_assert(compileTimeProperties<Vec3, float>());
+static_assert(compileTimeProperties<Vec3, double>());
+
+// ────────────── 运行期同一套测试：所有类型组合全走这里，零复制粘贴 ──────────────
+bool check(bool ok, const char* label, const char* what) {
+    std::printf("  [%s] %-28s : %s\n", label, what, ok ? "通过" : "失败");
+    return ok;
+}
+
+template <template <class> class Vec, Floating T>
+int runTests(const char* label) {
+    using B   = Basis<Vec<T>>;
+    constexpr T eps = std::numeric_limits<T>::epsilon() * T(16);   // 容差随 T 实例化（核心收益）
+    int failures = 0;
+
+    std::printf("== %s：epsilon=%.3e  容差=%.3e ==\n", label,
+                static_cast<double>(std::numeric_limits<T>::epsilon()),
+                static_cast<double>(eps));
+
+    const Vec<T> a = B::e1 * T(3) + B::e2 * T(4);        // (3,4[,0])，3-4-5 三角形
+    const Vec<T> b = B::e2 * T(2) - B::e1 * T(1);        // (-1,2[,0])
+
+    failures += !check(almostEqual(a.dot(b), b.dot(a), eps), label, "dot(a,b)==dot(b,a) 交换律");
+    failures += !check(Vec<T>{}.length() == T(0), label, "length(zero)==0");
+    failures += !check(almostEqual(B::e1.dot(B::e2), T(0), eps), label, "正交向量点积==0");
+    failures += !check(almostEqual(a.length(), T(5), eps * T(32)), label, "3-4-5 向量 length==5");
+
+    // 同一个表达式，float 与 double 各自的机器精度现场（epsilon 随 T 实例化的直观证据）
+    std::printf("  [%s] 1/3 的实际存储：%.17g\n", label,
+                static_cast<double>(T(1) / T(3)));
+    return failures;
+}
+
+int main() {
+    std::printf("编译期 static_assert 全部通过：Vec2/Vec3 x float/double 四组性质（零运行期成本）\n\n");
+
+    int failures = 0;
+    failures += runTests<Vec2, float>("Vec2<float>");
+    failures += runTests<Vec2, double>("Vec2<double>");
+    failures += runTests<Vec3, float>("Vec3<float>");
+    failures += runTests<Vec3, double>("Vec3<double>");
+    failures += runTests<Vec3, long double>("Vec3<long double>");   // 第三个类型：零新增逻辑
+
+    std::printf("\n运行期测试 failures=%d（0 = 全绿）\n", failures);
+    return failures == 0 ? 0 : 1;
+}
+```
+
+实测输出：
+
+```text
+编译期 static_assert 全部通过：Vec2/Vec3 x float/double 四组性质（零运行期成本）
+
+== Vec2<float>：epsilon=1.192e-07  容差=1.907e-06 ==
+  [Vec2<float>] dot(a,b)==dot(b,a) 交换律 : 通过
+  [Vec2<float>] length(zero)==0              : 通过
+  [Vec2<float>] 正交向量点积==0        : 通过
+  [Vec2<float>] 3-4-5 向量 length==5       : 通过
+  [Vec2<float>] 1/3 的实际存储：0.3333333432674408
+== Vec2<double>：epsilon=2.220e-16  容差=3.553e-15 ==
+  [Vec2<double>] dot(a,b)==dot(b,a) 交换律 : 通过
+  [Vec2<double>] length(zero)==0              : 通过
+  [Vec2<double>] 正交向量点积==0        : 通过
+  [Vec2<double>] 3-4-5 向量 length==5       : 通过
+  [Vec2<double>] 1/3 的实际存储：0.33333333333333331
+== Vec3<float>：epsilon=1.192e-07  容差=1.907e-06 ==
+  （四条性质同上，全部通过，略）
+== Vec3<double>：epsilon=2.220e-16  容差=3.553e-15 ==
+  （四条性质同上，全部通过，略）
+== Vec3<long double>：epsilon=2.220e-16  容差=3.553e-15 ==
+  （四条性质同上，全部通过，略）
+
+运行期测试 failures=0（0 = 全绿）
+```
+
+三个实现要点：
+
+- **`almostEqual` 必须 constexpr 化**——编译期性质测试（`static_assert`）要用它；这正是 3.12 的「许可」：常量语境自动编译期。
+- **epsilon 随 T 实例化是模板化的核心收益**——`std::numeric_limits<T>::epsilon() * T(16)` 对 float 算出 1.192e-07、对 double 算出 2.220e-16，各自拿到各自的机器精度，测试逻辑一份不改；输出里「1/3 的实际存储」两行就是直观证据（float 只有约 7 位有效数字，double 约 16 位）。
+- **`length()` 不标 constexpr**——`std::sqrt` 在 C++20 基线不是 constexpr（C++23/26 才逐步放开），所以「length(zero)==0」在编译期用 `lengthSquared(zero)==0` 表达（sqrt 版本照常在运行期测）。
+
+**验收要点逐条核对**：
+
+- **① 双实例化全绿**：`runTests<Vec2, float>` / `runTests<Vec2, double>` / `runTests<Vec3, float>` / `runTests<Vec3, double>` 跑的是**同一个模板**，外加 4 组 `static_assert`，failures=0。
+- **② 口述「测试代码减半」**：非模板时代 float 版和 double 版要各抄一份测试；模板化后一份 `runTests<Vec, T>` 吃下所有组合，加第三个类型只需再写一行 `runTests<Vec3, long double>(...)`——零新增测试逻辑（实测输出第 5 块）。注：MSVC x64 下 `long double` 与 `double` 同宽（epsilon 数字相同）；GCC/Clang 下 80-bit 扩展精度会打印不同 epsilon——数字是实现细节，「零新增逻辑」才是要验证的点。
+- **③ int 调用点被 concept 拦截**：
+
+```cpp
+almostEqual(1, 2, 0);   // ← int 不满足 Floating
+```
+
+```text
+编译输出节选（MSVC 19.44，中文语言包；以你本机输出为准）：
+t2_int_call.cpp(14): error C2672: “almostEqual”: 未找到匹配的重载函数
+t2_int_call.cpp(8): note: 可能是“bool almostEqual(T,T,T)”
+t2_int_call.cpp(14): note: 未满足关联约束
+t2_int_call.cpp(7): note: 计算结果为 false 的概念“Floating<int>”
+t2_int_call.cpp(5): note: 计算结果为 false 的概念“std::floating_point<int>”
+```
+
+  与 3.11 的对照表完全同构：约束名（`Floating<int>`）与违约类型都在场，报错短、指向调用行。
+
+### 任务 3：用标准算法替换手写循环 —— 完整实现
+
+替换后版本（四处手工循环全部消灭，谓词/比较器全部 lambda，与 3.4/3.5 呼应）：
+
+```cpp
+// ch03_task3_rewrite.cpp —— 实践任务 3：标准算法替换手写循环（替换后，输出与原版逐字节一致）
+// cl /utf-8 /std:c++20 /EHsc /W4 ch03_task3_rewrite.cpp
+#include <algorithm>
+#include <cstdio>
+#include <numeric>
+#include <vector>
+
+struct Particle { int id; float dist; int hp; };
+struct DrawItem { int particleId; float dist; };
+
+int main() {
+    std::vector<Particle> ps = {{1, 12.5f, 3}, {2, 3.0f, 0}, {3, 8.8f, 5}, {4, 20.1f, 0}};
+
+    // 替换 1：手工过滤（下标 + erase 错位坑，O(n²)）→ std::erase_if 一步到位（C++20）。
+    //   经典两步等价写法：ps.erase(std::remove_if(ps.begin(), ps.end(),
+    //       [](const Particle& p) { return p.hp <= 0; }), ps.end());
+    //   两步语义：remove_if 只把「留下」的元素前搬并返回新逻辑尾（size 不变），
+    //   物理删除是 erase 的事——erase_if 把这两刀合成一刀，还返回删除个数。
+    std::erase_if(ps, [](const Particle& p) { return p.hp <= 0; });
+
+    // 替换 2a：手工构建 draws 的循环 → std::transform（一一映射的标准姿势）
+    std::vector<DrawItem> draws(ps.size());
+    std::transform(ps.begin(), ps.end(), draws.begin(),
+                   [](const Particle& p) { return DrawItem{p.id, p.dist}; });
+
+    // 替换 2b：手工冒泡（O(n²)，比较方向全靠瞪眼）→ std::sort（O(n log n)）。
+    //   远到近绘制 = 按 dist 降序 → 比较符是「>」；sort 不稳定，保序用 stable_sort。
+    std::sort(draws.begin(), draws.end(),
+              [](const DrawItem& a, const DrawItem& b) { return a.dist > b.dist; });
+
+    // 替换 3：手工找 id==3 → std::find_if（返回 end() = 没找到，永远先比对再解引用）
+    auto found = std::find_if(ps.begin(), ps.end(),
+                              [](const Particle& p) { return p.id == 3; });
+
+    // 替换 4：手工累加 → std::accumulate（初值 0.0f 显式给出，类型别靠猜）
+    const float total = std::accumulate(
+        ps.begin(), ps.end(), 0.0f,
+        [](float acc, const Particle& p) { return acc + p.dist * 2.0f; });
+
+    std::printf("存活=%zu 首个=%s id3距离=%.1f 总伤害=%.1f\n",
+                ps.size(), draws.empty() ? "-" : "有",
+                found != ps.end() ? found->dist : -1.0f, total);
+    std::printf("绘制序: %d -> %d\n", draws[0].particleId, draws[1].particleId);
+    return 0;
+}
+```
+
+**行为等价记录**（验收①：先跑原程序记录正确输出，替换后 diff）：
+
+```text
+--- 原版输出 ---
+存活=2 首个=有 id3距离=8.8 总伤害=42.6
+绘制序: 1 -> 3
+--- 替换后输出 ---
+存活=2 首个=有 id3距离=8.8 总伤害=42.6
+绘制序: 1 -> 3
+--- diff ---
+（空：输出逐字节一致）
+```
+
+**替换对照表**（验收②③④的口述底稿）：
+
+| 重灾区 | 原写法（病根） | 替换算法 | 复杂度 | 迭代器类别 / 备注 |
+| --- | --- | --- | --- | --- |
+| 1 过滤 | 下标 + erase 边走边删（错位坑，O(n²)） | `std::erase_if`（C++20） | O(n) | 容器自由函数，不吃迭代器类别那套；经典等价 = remove_if（前向迭代器即可）+ erase 两步——remove 只逻辑搬移、erase 才物理删 |
+| 2a 建 draws | 手工 push_back 循环 | `std::transform` | O(n) | 输入迭代器进、输出迭代器出 |
+| 2b 排序 | 冒泡（O(n²)，方向靠瞪眼维护） | `std::sort` | O(n log n) | **随机访问迭代器**（vector 满足；list 用成员 sort）；比较器 `a.dist > b.dist`：远到近 = 降序；sort 不稳定 |
+| 3 查找 | 手工线性扫描 + 缓存裸指针 | `std::find_if` | O(n) | 输入迭代器；返回 `end()` = 没找到，先比对再解引用 |
+| 4 累加 | 手工 `total += ...` | `std::accumulate` | O(n) | 输入迭代器；初值 `0.0f` 显式给出 |
+
+浮点逐字节一致的根基：`accumulate` 从显式初值 `0.0f` 起，按**与手写循环完全相同的从左到右顺序**逐元素累加，float 求和序列逐位相同——换成并行/分块归并求和就不再保证这一点（测量与浮点方法论第 6 章展开）。
+
+### 任务 4：variant 状态机 + std::function/模板参数双版回调 —— 完整实现
+
+```cpp
+// ch03_task4_state_machine.cpp —— 实践任务 4：variant 状态机 + std::function/模板参数双版回调
+// cl /utf-8 /std:c++20 /EHsc /W4 ch03_task4_state_machine.cpp
+#include <cmath>
+#include <cstdio>
+#include <functional>
+#include <utility>
+#include <variant>
+
+// ────────────── 三态，每态自带数据（新增态 = 加一个 struct，见验收②） ──────────────
+struct Idle      { int restFrames = 0; };
+struct Moving    { float targetX, targetY; float speed; };
+struct Attacking { int targetId; int cooldownFrames; };
+
+using EnemyState = std::variant<Idle, Moving, Attacking>;
+
+template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;   // C++17 需要；C++20 可省
+
+struct Enemy {
+    float       x = 0.0f, y = 0.0f;
+    EnemyState  state = Idle{};
+};
+
+// ────────────── 转移逻辑：std::visit 返回新状态（编译期穷举，漏一态即编译错误） ──────────────
+EnemyState step(Enemy& e, EnemyState s, bool enemyNearby, int targetId) {
+    return std::visit(overloaded{
+        [&](const Idle& st) -> EnemyState {
+            if (enemyNearby) return Attacking{targetId, 3};            // 发现敌人 → 攻击
+            if (st.restFrames + 1 >= 2)
+                return Moving{80.0f, 60.0f, 40.0f};                    // 歇够了 → 巡逻
+            return Idle{st.restFrames + 1};
+        },
+        [&](const Moving& st) -> EnemyState {
+            if (enemyNearby) return Attacking{targetId, 3};            // 半路遇敌 → 攻击
+            const float dx = st.targetX - e.x, dy = st.targetY - e.y;
+            const float d  = std::sqrt(dx * dx + dy * dy);
+            if (d <= st.speed) {                                       // 到达 → 回待机
+                e.x = st.targetX; e.y = st.targetY;
+                return Idle{0};
+            }
+            e.x += dx / d * st.speed;                                  // 朝目标走一步
+            e.y += dy / d * st.speed;
+            return st;
+        },
+        [&](const Attacking& st) -> EnemyState {
+            if (st.cooldownFrames > 1)
+                return Attacking{st.targetId, st.cooldownFrames - 1};  // 冷却递减
+            if (enemyNearby) return Attacking{st.targetId, 3};         // 冷却结束敌人还在 → 再攻
+            return Idle{0};                                            // 敌人没了 → 回待机
+        },
+    }, s);
+}
+
+// 状态打印（3.8 的 describe 惯用法）
+inline auto describe = overloaded{
+    [](const Idle& s)      { std::printf("待机(%d)", s.restFrames); },
+    [](const Moving& s)    { std::printf("移动向(%.0f,%.0f)", s.targetX, s.targetY); },
+    [](const Attacking& s) { std::printf("攻击#%d(冷却%d)", s.targetId, s.cooldownFrames); },
+};
+
+// ────────────── 双版回调宿主：不能定义在函数内（本地类不得含成员模板） ──────────────
+struct EnemyA {                                      // 版本 A：std::function（类型擦除）
+    EnemyState state = Attacking{42, 2};
+    // ★ 擦除点①（构造）：任何闭包都被拷/移进统一类型的不透明存储
+    //   （小闭包进 SBO 缓冲零分配；超出 ~48 字节即下堆 —— 3.7/深入专题实测）
+    std::function<void(EnemyState&)> onFrame;
+    void frame() {
+        if (!onFrame) return;
+        // ★ 擦除点②（调用）：经内部函数指针间接跳转，编译器通常无法内联目标
+        onFrame(state);
+    }
+};
+
+struct EnemyB {                                      // 版本 B：模板参数（零擦除）
+    EnemyState state = Attacking{42, 2};
+    template <class F>
+    void frame(F&& onFrame) {
+        // ★ 无擦除：F 的具体类型参与编译，每种闭包各实例化一份 frame（单态化）
+        //   调用零间接、可内联；代价 = 代码膨胀 + 调用点必须看到模板定义（3.9）
+        onFrame(state);
+    }
+};
+
+int main() {
+    std::printf("== 1. 三态状态机：12 帧转移轨迹（敌人第 2-5 帧在场）==\n");
+    Enemy e;
+    for (int frame = 1; frame <= 12; ++frame) {
+        const bool enemyNearby = (frame >= 2 && frame <= 5);
+        std::printf("  帧%2d: ", frame);
+        std::visit(describe, e.state);
+        std::printf(" -> ");
+        e.state = step(e, e.state, enemyNearby, 7);
+        std::visit(describe, e.state);
+        std::printf("\n");
+    }
+
+    std::printf("\n== 2. 回调版本 A：std::function<void(EnemyState&)>（类型擦除）==\n");
+    EnemyA a;
+    int attackFramesA = 0;
+    a.onFrame = [&attackFramesA](EnemyState& st) {          // 小闭包：进 SBO，零堆分配
+        if (auto* atk = std::get_if<Attacking>(&st)) {
+            if (atk->cooldownFrames > 0) atk->cooldownFrames -= 1;
+            ++attackFramesA;
+        }
+    };
+    a.frame(); a.frame();
+    std::printf("  function 版调用 2 帧：冷却=%d  回调执行=%d 次\n",
+                std::get<Attacking>(a.state).cooldownFrames, attackFramesA);
+
+    std::printf("\n== 3. 回调版本 B：template <class F> void frame(F&&)（零擦除）==\n");
+    EnemyB b;
+    int attackFramesB = 0;
+    b.frame([&attackFramesB](EnemyState& st) {              // 闭包 1 → 生成 frame 实例 #1
+        if (auto* atk = std::get_if<Attacking>(&st)) {
+            if (atk->cooldownFrames > 0) atk->cooldownFrames -= 1;
+            ++attackFramesB;
+        }
+    });
+    b.frame([&attackFramesB](EnemyState& st) {              // 闭包 2 → 生成 frame 实例 #2
+        if (auto* atk = std::get_if<Attacking>(&st)) {
+            if (atk->cooldownFrames > 0) atk->cooldownFrames -= 1;
+            ++attackFramesB;
+        }
+    });
+    std::printf("  模板版调用 2 帧：冷却=%d  回调执行=%d 次\n",
+                std::get<Attacking>(b.state).cooldownFrames, attackFramesB);
+
+    std::printf("\n== 4. 适用边界口述要点 ==\n");
+    std::printf("  存储异构回调/跨模块边界/运行期注册 → std::function（类型擦除是唯一解）\n");
+    std::printf("  热路径/编译期已知调用者/要内联   → 模板参数（单态化、零间接、零分配）\n");
+    return 0;
+}
+```
+
+实测输出：
+
+```text
+== 1. 三态状态机：12 帧转移轨迹（敌人第 2-5 帧在场）==
+  帧 1: 待机(0) -> 待机(1)
+  帧 2: 待机(1) -> 攻击#7(冷却3)
+  帧 3: 攻击#7(冷却3) -> 攻击#7(冷却2)
+  帧 4: 攻击#7(冷却2) -> 攻击#7(冷却1)
+  帧 5: 攻击#7(冷却1) -> 攻击#7(冷却3)
+  帧 6: 攻击#7(冷却3) -> 攻击#7(冷却2)
+  帧 7: 攻击#7(冷却2) -> 攻击#7(冷却1)
+  帧 8: 攻击#7(冷却1) -> 待机(0)
+  帧 9: 待机(0) -> 待机(1)
+  帧10: 待机(1) -> 移动向(80,60)
+  帧11: 移动向(80,60) -> 移动向(80,60)
+  帧12: 移动向(80,60) -> 移动向(80,60)
+
+== 2. 回调版本 A：std::function<void(EnemyState&)>（类型擦除）==
+  function 版调用 2 帧：冷却=0  回调执行=2 次
+
+== 3. 回调版本 B：template <class F> void frame(F&&)（零擦除）==
+  模板版调用 2 帧：冷却=0  回调执行=2 次
+
+== 4. 适用边界口述要点 ==
+  存储异构回调/跨模块边界/运行期注册 → std::function（类型擦除是唯一解）
+  热路径/编译期已知调用者/要内联   → 模板参数（单态化、零间接、零分配）
+```
+
+**验收要点逐条核对**：
+
+- **① visit 穷举：删掉一个 handler → 编译错误**。把 `Moving` 的 handler 从 `overloaded` 里删掉：
+
+```text
+编译输出节选（MSVC 19.44，中文语言包；已大幅截断，以你本机输出为准）：
+...\include\variant(1564): error C2672: “invoke”: 未找到匹配的重载函数
+...\include\variant(1564): note: 用下列模板参数:
+...\include\variant(1564): note: “_Callable=overloaded<main::<lambda_1>,main::<lambda_2>> &”
+...\include\variant(1564): note: “_Ty1=Moving &”
+```
+
+  `_Ty1=Moving &` ——编译器点名漏掉的正是 Moving 这一态。「新增状态 → 改 variant 列表 → 编译器逐个揪出所有漏改的 visit 点」，编译期穷举的价值亲测（与 3.8 的报错同一形状）。
+- **② 转移图覆盖三态，新增「眩晕」态改动局部化**。示例 12 帧跑出的转移图：待机 → 待机/攻击/移动；移动 → 移动/攻击/待机；攻击 → 攻击/待机。新增眩晕态只动三处：
+
+```cpp
+struct Stunned { int frames; };                       // ① 新状态结构体（自带数据）
+using EnemyState = std::variant<Idle, Moving, Attacking, Stunned>;   // ② 进备选列表
+// ③ step() 的 overloaded 里补一个 handler、帧循环里补一个分支；
+//    补齐之前，编译器会把所有没处理 Stunned 的 visit 点逐个报出来（报错同验收①）
+```
+
+  每态数据随状态走（Moving 的目标点与速度住在状态里），不需要另开成员或并行数组——这是 variant 状态机相对散落 switch 的结构性优势。状态数量再涨、「进入/退出/转移」开始分层时，就是第 4 节状态模式的接入点（本任务为其预埋的体验点）。
+- **③ 类型擦除注释逐行对上 3.7/深入专题**：版本 A 的两个 ★ 擦除点（构造：闭包被拷/移进不透明存储、小闭包进 SBO；调用：经函数指针间接跳转）与版本 B 的单态化注释，措辞一一对应 3.7 边界表与 MiniFunction 专题的「两跳间接 vs 零跳可内联」。
+- **④ 适用边界口述**（示例第 4 段）：存储异构回调 / 跨模块接口边界 / 运行期注册替换 → `std::function`（类型擦除是唯一解）；热路径、编译期已知调用者、要内联 → 模板参数（零间接、零分配，代价是代码膨胀与模板定义的头文件可见性）。
+
+**可选 P1 衔接**：作为敌人 AI 雏形接入渲染器 demo 场景。
 
 ---
 

@@ -23,28 +23,28 @@
 - 容器选型有依据、迭代器失效有戒心，算法库优先于手写循环。
 - 跨过「只会用模板」到「能写带约束的模板」：实例化模型、concepts、constexpr、type traits、CRTP 概念级。
 - 吃透可调用对象全景（lambda/std::function/std::bind/std::invoke）与词汇类型（optional/variant/any/span）的用法与选型边界。
-- 教程：ch03（未写）｜联动：为 P1 沉淀泛型 ResourceManager。
+- 教程：[ch03-standard-library-and-generic-programming](./tutorial/ch03-standard-library-and-generic-programming.md)（已定稿）｜联动：为 P1 沉淀泛型 ResourceManager。
 
 ## 阶段 4｜工具链工程化：CMake 构建体系
 
 - 摆脱 IDE 一键工程黑盒：target 属性传递、FetchContent/find_package 接库、CTest 测试。
 - 产出可交接工程：新环境克隆后 configure→build→test 三步从零构建。
-- 教程：ch04（未写）｜联动：P1「CMake 工程化」里程碑落点；第 6 节直接复用此工程。
+- 教程：[ch04-cmake-build-system](./tutorial/ch04-cmake-build-system.md)（已定稿）｜联动：P1「CMake 工程化」里程碑落点；第 6 节直接复用此工程。
 
 ## 阶段 5｜并发与内存模型：数据竞争的边界
 
 - 理解数据竞争即未定义行为，mutex/condition_variable/atomic 与六种内存序的安全默认和降级路径。
 - 目标是「能识别与治理竞态、默认顺序一致、必要时才降级」，不追求精通 lock-free；用 TSan 验证。
-- 教程：ch05（未写）｜联动：P1「主线程渲染 + 工作线程异步加载」实践。
+- 教程：[ch05-concurrency-and-memory-model](./tutorial/ch05-concurrency-and-memory-model.md)（已定稿）｜联动：P1「主线程渲染 + 工作线程异步加载」实践。
 
 ## 阶段 6｜实时性能意识：帧预算、缓存友好与热路径零分配
 
 - 建立「每帧都是一次 16.6ms 预算考试」世界观：会用剖析器定位帧耗时、解读火焰图。
 - 理解缓存层级对数据布局的支配（AoS vs SoA），热路径零分配炼成肌肉记忆。
-- 教程：ch06（未写）｜联动：第 4 节 ECS 数据导向设计的性能出处。
+- 教程：[ch06-real-time-performance](./tutorial/ch06-real-time-performance.md)（已定稿）｜联动：第 4 节 ECS 数据导向设计的性能出处。
 
 ## 阶段 7｜大型工程阅读与重构：以 UE 源码与 Core Guidelines 为标尺
 
 - 掌握百万行级代码库定点阅读方法论：调用链追踪 + 调试器断点验证，不通读。
 - 以 UE 源码与 C++ Core Guidelines 为标尺形成工程审美，clang-tidy 护航小步重构。
-- 教程：ch07（未写）｜联动：UE 源码对应根纲领推荐资源第 14 条。
+- 教程：[ch07-large-codebase-reading-and-refactoring](./tutorial/ch07-large-codebase-reading-and-refactoring.md)（已定稿）｜联动：UE 源码对应根纲领推荐资源第 14 条。
