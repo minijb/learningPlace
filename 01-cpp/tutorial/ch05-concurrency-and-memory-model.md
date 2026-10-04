@@ -1146,6 +1146,8 @@ int  payload = 0;
 
 ### 实践任务
 
+> 本节是要点式参考思路；三道任务的**完整可编译实现与实测输出**见本章末尾《实践任务完整参考实现（可编译源码 + 实测输出）》一节。
+
 **任务 1 参考思路**：
 
 - **骨架**：`TaskQueue<std::string> orders`（5.8 原样复用）+ 完成队列 `std::mutex + std::vector<LoadResult>`（主线程帧末批量取，也可再包一层带 cv 的队列）；两个 `std::jthread` 工作线程循环 `try_pop`；主线程帧循环 + 输入检查。
@@ -1198,6 +1200,519 @@ while (running) {
 6. **禁止事项**：不跨线程传引用/`span`/`string_view`；不手写 lock/unlock；不用 detach；不加锁做 IO；无数据不降内存序。
 
 评分式验收：每条约定能指出「对应的代码位置」与「违反时的故障模式」两栏；选做题（release/acquire 版就绪通知）三句话能说清「cv 版适合『队列语义』的等待-消费，atomic 版适合『状态发布』的轻量通知，且后者不能携带队列的等待/唤醒语义」即达标。完整工程化实现留给 P1/P3。
+
+---
+
+## 实践任务完整参考实现（可编译源码 + 实测输出）
+
+> 前一节《实践任务》是要点式参考思路，本节给出三道任务的**完整实现**。三份源码在双工具链下**零警告**编译（Windows：`cl /utf-8 /nologo /std:c++20 /EHsc /W4`，实测 MSVC 19.50；WSL2 Ubuntu 24.04：`g++ 13.3 -std=c++20 -Wall -Wextra -pthread`），并运行核对过输出；任务 2 的 TSan 红/绿报告为 WSL2 真实运行输出。输出里的帧数、间隔小数会有轻微波动（调度使然），校验和则逐字节可复现（unsigned 溢出算术跨平台确定）。
+>
+> **环境备注（新版 WSL2 必读）**：内核 6.5+ 的默认 ASLR 熵会让 TSan 程序启动即报 `FATAL: ThreadSanitizer: unexpected memory mapping`——不是你的代码有错。绕过：运行时用 `setarch $(uname -m) -R ./程序` 关掉该进程的 ASLR（或 `sudo sysctl vm.mmap_rnd_bits=28` 全局降熵）。
+
+### 任务 1：迷你异步资源加载器（核心层）
+
+四个线程、三样共享状态，每样都答得上「谁拥有、谁同步」：
+
+| 共享对象 | 类型 | 生产者 → 消费者 | 同步原语 | 代码位置 |
+| --- | --- | --- | --- | --- |
+| `g_orders` | `TaskQueue<std::string>`（5.8 原样复用） | 输入线程 → 2×工作线程 | 队列内部 mutex + cv 谓词等待 | `push` / `try_pop` / `close` |
+| `g_done` | `DoneQueue`（mutex + `vector<LoadResult>`） | 工作线程 → 主线程 | mutex；帧末**批量** `take_all` 一次锁搬空 | `DoneQueue` |
+| `g_shutdown` | `std::atomic<bool>` | 输入线程 → 主线程 | atomic（显式标 acquire/release） | `input_thread` / 帧循环条件 |
+| 上屏（printf） | —— | **只准主线程** | 无需同步（单线程纪律，任务 3） | `main` 帧循环 |
+
+设计要点：① 工作线程全程不 `printf`——输出集中到主线程帧末，输出干净且天然满足「上屏只准主线程」；② 工作线程退出条件长在 `TaskQueue::close()` 里（`try_pop` 返 `nullopt` 即收工），不另设裸标志；③ 帧循环用 `sleep_until` + 稳定时钟做**定长步进**，帧间隔统计本身就是验收要点①的证据；④ 主线程 `join` 全部线程后再做一次**兜底上屏**，保证 10 单全部上屏。校验和用参考思路指定的 FNV-1a（生成端与上屏端共用同一函数，逐单核对）。
+
+```cpp
+// ch05_task1_async_loader.cpp —— 实践任务 1：迷你异步资源加载器（核心层）
+// 「主线程渲染 + 工作线程异步加载」的控制台完整闭环。
+//
+// 构建（Windows + VS2022）：
+//   cl /utf-8 /std:c++20 /EHsc /W4 ch05_task1_async_loader.cpp
+// 构建（Linux / WSL2）：
+//   g++ -std=c++20 -Wall -Wextra -pthread ch05_task1_async_loader.cpp -o loader
+//
+// 运行：程序开场自动下单 10 个加载任务并开始帧循环；键入 q 回车关停。
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <random>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using namespace std::chrono;
+
+// ────────────── 5.8 的 TaskQueue 原样复用：下单/取单的唯一通道 ──────────────
+template <typename T>
+class TaskQueue {
+public:
+    void push(T value) {                        // 生产端：可多线程并发调用
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            q_.push(std::move(value));           // 任务对象 move 进队列
+        }
+        cv_.notify_one();
+    }
+
+    std::optional<T> try_pop() {                 // 消费端：阻塞直到有任务或已关停
+        std::unique_lock<std::mutex> lock(m_);
+        cv_.wait(lock, [this] { return !q_.empty() || closed_; });
+        if (q_.empty()) return std::nullopt;     // closed_ 且无任务 ⟹ 收工
+        T value = std::move(q_.front());
+        q_.pop();
+        return value;
+    }
+
+    void close() {                               // 关停：影响所有等待者
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            closed_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::queue<T> q_;
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    bool closed_ = false;
+};
+
+// ────────────── 完成队列：mutex 保护的 vector，主线程帧末批量取走 ──────────────
+struct LoadResult {
+    std::string name;                 // 资源名
+    unsigned    checksum = 0;         // 工作线程算出的确定性校验和
+};
+
+class DoneQueue {
+public:
+    void push(LoadResult r) {                              // 工作线程调用
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            items_.push_back(std::move(r));
+        }
+    }
+
+    std::vector<LoadResult> take_all() {                   // 主线程帧末调用：一次锁、批量 move 出全部
+        std::lock_guard<std::mutex> lock(m_);
+        std::vector<LoadResult> out = std::move(items_);
+        items_.clear();                                    // moved-from 后 clear()，回到确定空态
+        return out;
+    }
+
+private:
+    std::vector<LoadResult> items_;
+    std::mutex m_;
+};
+
+// ────────────── 确定性校验和：FNV-1a（32 位，unsigned 溢出算术） ──────────────
+// 生成端（工作线程）与验证端（主线程上屏时）共用这一个实现，对照才成立。
+unsigned checksum(std::string_view name) {
+    unsigned h = 2166136261u;
+    for (char c : name) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+    return h;
+}
+
+// ────────────── 共享状态：只有三样，每样都答得上「谁拥有、谁同步」 ──────────────
+TaskQueue<std::string> g_orders;      // 待加载任务（输入线程 → 工作线程）
+DoneQueue              g_done;        // 已完成结果（工作线程 → 主线程）
+std::atomic<bool>      g_shutdown{false};   // 只负责结束主线程帧循环（工作线程退出条件在队列 close 里）
+
+// ────────────── 工作线程 ×2：取单 → 解码 → 交结果，全程不 printf ──────────────
+void worker(int id) {
+    std::mt19937 rng(0xC05EEu + static_cast<unsigned>(id));      // 每线程一把独立随机引擎
+    std::uniform_int_distribution<int> decode_ms(50, 200);       // 模拟解码耗时 50–200ms
+
+    while (auto task = g_orders.try_pop()) {                     // 关停后队列排空，try_pop 返回 nullopt
+        std::this_thread::sleep_for(milliseconds(decode_ms(rng)));  // 模拟「读文件 + 解码」重活
+        g_done.push(LoadResult{*task, checksum(*task)});         // 结果进完成队列（锁在 push 内部）
+    }
+}
+
+// ────────────── 输入线程：开场下单 10 个任务，然后监听 q 触发关停 ──────────────
+// 主线程有帧循环在身，阻塞读 stdin 会卡死帧率，所以 q 的监听放在输入线程
+//（正文参考思路明确「CRT 非阻塞读或另起输入线程均可」；MSVC 下 _kbhit 是另一条路，但不可移植）。
+void input_thread() {
+    const char* assets[10] = {
+        "tex_boss.png", "tex_hero.png", "tex_slime.png", "tex_tiles.png",
+        "tex_ui.png",   "tex_sky.hdr",  "font_cjk.ttf",  "mdl_tree.fbx",
+        "snd_hit.wav",  "snd_bgm.ogg",
+    };
+    for (const char* a : assets) g_orders.push(a);               // 下单：10 个加载任务
+    std::printf("[输入] 已下单 10 个加载任务，键入 q 回车关停\n");
+
+    std::string line;
+    while (std::getline(std::cin, line)) {                       // 阻塞等输入，不占帧循环的 CPU
+        if (line == "q" || line == "Q") break;
+    }
+    g_orders.close();                    // 关停协议第一步：队列 close（工作线程排空后自然退出）
+    g_shutdown.store(true, std::memory_order_release);           // 第二步：通知主线程结束帧循环
+    std::printf("[输入] 任务队列已关停\n");
+}
+
+int main() {
+    std::printf("[主线程] 帧循环开始（每帧目标 16ms）\n");
+    std::jthread input(input_thread);
+    std::jthread w1(worker, 1);          // jthread：忘 join 也不会 terminate，这里仍显式 join 收线
+    std::jthread w2(worker, 2);
+
+    // ── 主线程：帧循环。sleep_until + 稳定时钟的定长步进，帧间隔本身就是验收证据 ──
+    auto next_frame = steady_clock::now();
+    auto prev_frame = next_frame;
+    int    frames   = 0;
+    unsigned screened = 0, verified = 0;
+    double min_ms = 1e9, max_ms = 0.0, sum_ms = 0.0;
+
+    while (!g_shutdown.load(std::memory_order_acquire)) {
+        next_frame += milliseconds(16);                          // 定长帧步进（绝对时间点，抵消耗时漂移）
+        auto frame_start = steady_clock::now();
+        double dt = duration<double, std::milli>(frame_start - prev_frame).count();
+        prev_frame = frame_start;
+        ++frames;
+        if (frames > 1) {                                        // 第 1 帧的间隔含线程启动噪声，不计入统计
+            sum_ms += dt;
+            min_ms = std::min(min_ms, dt);
+            max_ms = std::max(max_ms, dt);
+        }
+
+        // 帧末：收走全部完成项并「上屏」——批量 take_all 一次锁、一次 move，减少锁竞争
+        for (const LoadResult& r : g_done.take_all()) {
+            ++screened;
+            bool ok = (r.checksum == checksum(r.name));          // 上屏端重算校验和，逐单核对
+            if (ok) ++verified;
+            std::printf("[帧 %03d] 上屏 %-14s 校验和=0x%08X 核对%s\n",
+                        frames, r.name.c_str(), r.checksum, ok ? "通过" : "不一致");
+        }
+
+        std::this_thread::sleep_until(next_frame);               // 睡到下一帧，帧率与解码完全解耦
+    }
+
+    // ── 关停协议收尾：join 全部线程，再做最后一次兜底上屏 ──
+    input.join();                                                // 输入线程已 close + 置位，即将退出
+    w1.join();  w2.join();                                       // 工作线程排空队列后已自然退出
+    for (const LoadResult& r : g_done.take_all()) {              // 兜底：join 后完成的结果也要上屏
+        ++screened;
+        bool ok = (r.checksum == checksum(r.name));
+        if (ok) ++verified;
+        std::printf("[收尾] 上屏 %-14s 校验和=0x%08X 核对%s\n",
+                    r.name.c_str(), r.checksum, ok ? "通过" : "不一致");
+    }
+
+    std::printf("[主线程] 关停完成：共 %d 帧，帧间隔 min/avg/max = %.1f/%.1f/%.1f ms，"
+                "上屏 %u/10（校验和通过 %u）\n",
+                frames, min_ms, sum_ms / (frames > 1 ? frames - 1 : 1), max_ms,
+                screened, verified);
+    return (screened == 10 && verified == 10) ? 0 : 1;           // 退出码即验收：10/10 上屏且核对全过
+}
+```
+
+构建运行与实测输出（`{ sleep 1.5; echo q; } | ./loader` 模拟「跑 1.5 秒后按 q」；工作线程不打印，所以输出只有上屏行，天然可读）：
+
+```text
+$ g++ -std=c++20 -Wall -Wextra -pthread ch05_task1_async_loader.cpp -o loader   ← 零警告
+$ { sleep 1.5; echo q; } | ./loader
+[主线程] 帧循环开始（每帧目标 16ms）
+[输入] 已下单 10 个加载任务，键入 q 回车关停
+[帧 005] 上屏 tex_hero.png   校验和=0xF152A896 核对通过
+[帧 013] 上屏 tex_boss.png   校验和=0xF34B27B3 核对通过
+[帧 018] 上屏 tex_slime.png  校验和=0xE6E1B404 核对通过
+[帧 019] 上屏 tex_tiles.png  校验和=0xD5CE36A9 核对通过
+[帧 025] 上屏 tex_sky.hdr    校验和=0x6ECAE374 核对通过
+[帧 029] 上屏 tex_ui.png     校验和=0xFC690F74 核对通过
+[帧 034] 上屏 font_cjk.ttf   校验和=0x6D7268D1 核对通过
+[帧 038] 上屏 mdl_tree.fbx   校验和=0xF6B1DED7 核对通过
+[帧 040] 上屏 snd_hit.wav    校验和=0x5AC1E54A 核对通过
+[帧 045] 上屏 snd_bgm.ogg    校验和=0xF41F5F84 核对通过
+[输入] 任务队列已关停
+[主线程] 关停完成：共 94 帧，帧间隔 min/avg/max = 15.9/16.0/16.1 ms，上屏 10/10（校验和通过 10）
+（退出码 0）
+```
+
+MSVC 侧同代码复跑，末行：`关停完成：共 74 帧，帧间隔 min/avg/max = 15.0/16.0/17.1 ms，上屏 10/10（校验和通过 10）`——两工具链校验和逐字节一致（unsigned 溢出算术跨平台确定），帧数与间隔小数随调度波动属预期。
+
+验收四条逐条对照：
+
+| 验收要点 | 证据（对照上面输出） |
+| --- | --- |
+| ① 加载期间帧间隔 ≈16ms | 加载高峰（帧 5–45）正发生在任务解码期间；统计行 `15.9/16.0/16.1` ms，帧率不塌 |
+| ② 每个上屏校验和与规则一致 | 上屏端对每个名字重算 FNV-1a 比对，`核对通过 ×10`；退出码断言 `verified == 10` |
+| ③ 关停零崩溃、零挂死 | `q` → close → 工作线程排空退出 → join → 兜底上屏 → 退出码 0；进程正常消失 |
+| ④ 无裸 lock/unlock、无 detach | 全文件 `grep -nE "\.lock\(\)|\.unlock\(\)|detach"` 零匹配；线程全部显式 `join` |
+
+### 任务 2：红 → 绿仪器闭环（扩展层 A）
+
+复制任务 1 代码动两处手术（覆盖任务菜单的①②③种形态中的两种；②的忙等形态 5.2 的 `minimal_race` 已单独演示过）。坏文件 `ch05_task2_race_red.cpp`，其余部分与任务 1 逐字节一致，两处坏点如下：
+
+```cpp
+// ── 坏点②：TaskQueue::try_pop 的谓词等待被换成「无锁忙等」 ──
+std::optional<T> try_pop() {
+    for (;;) {
+        // ❌ 不持锁裸读 q_ / closed_ —— 与 push()/close() 的加锁写无同步关系（数据竞争），
+        //    且没人睡下去，两个工作线程把 CPU 空转烧满（5.4 反面教材复活）。
+        while (q_.empty() && !closed_) std::this_thread::yield();
+
+        std::lock_guard<std::mutex> lock(m_);
+        if (!q_.empty()) { T value = std::move(q_.front()); q_.pop(); return value; }
+        if (closed_) return std::nullopt;
+    }
+}
+
+// ── 坏点①/③：DoneQueue 的 mutex 被拆掉（完成队列就是被无锁 push_back 的共享 vector）──
+class DoneQueue {
+public:
+    void push(LoadResult r) {
+        items_.push_back(std::move(r));               // ❌ 无锁写：与其他 push / take_all 并发
+    }
+    std::vector<LoadResult> take_all() {
+        std::vector<LoadResult> out = std::move(items_);   // ❌ 无锁读+搬空：与 push 并发
+        items_.clear();
+        return out;
+    }
+private:
+    std::vector<LoadResult> items_;                   // 没有 mutex —— 这就是竞态本身
+};
+```
+
+**红**：WSL2 下 TSan 构建运行（`g++ -std=c++20 -O1 -g -fsanitize=thread -pthread ch05_task2_race_red.cpp -o red_tsan`），单次运行抓出 **13 条** `WARNING: ThreadSanitizer`，全部落在两族冲突上。报告节选（模板长名已折叠为 `…`，行号与结构未动，以你本机输出为准）：
+
+```text
+WARNING: ThreadSanitizer: data race (pid=762)          【第 1 族：坏点②——忙等裸读队列状态】
+  Read of size 8 at 0x55555555d1d0 by thread T2:
+    #0 std::operator==(…) bits/stl_deque.h:273                ← empty() 内部的迭代器比较
+    #1 std::deque<…>::empty() bits/stl_deque.h:1348
+    #3 TaskQueue<std::string>::try_pop() ch05_task2_race_red.cpp:47   ← 忙等循环裸读 q_
+    #4 worker(int) ch05_task2_race_red.cpp:110
+
+  Previous write of size 8 at 0x55555555d1d0 by thread T1 (mutexes: write M0):
+    #0 std::deque<…>::emplace_back(…) bits/deque.tcc:173
+    #3 TaskQueue<std::string>::push(std::string) ch05_task2_race_red.cpp:38
+    #4 input_thread() ch05_task2_race_red.cpp:122                     ← 下单线程「持锁」写——但读侧没锁！
+
+  Location is global 'g_orders' of size 176
+  …（互斥量创建栈与线程创建栈从略）……
+
+WARNING: ThreadSanitizer: data race (pid=762)          【第 2 族：坏点①/③——完成队列无锁】
+  Read of size 8 at 0x55555555d180 by thread T3:
+    #0 std::vector<LoadResult>::emplace_back(LoadResult&&) bits/vector.tcc:114
+    #2 DoneQueue::push(LoadResult) ch05_task2_race_red.cpp:83         ← 工作线程无锁 push_back
+    #3 worker(int) ch05_task2_race_red.cpp:112
+
+  Previous write of size 8 at 0x55555555d180 by main thread:
+    #0 std::_Vector_base<…> 移动构造（内部指针三件套整体搬家）bits/stl_vector.h:108
+    #4 DoneQueue::take_all() ch05_task2_race_red.cpp:87               ← 主线程帧末无锁搬空
+    #5 main ch05_task2_race_red.cpp:150
+
+  Location is global 'g_done' of size 24
+
+SUMMARY: ThreadSanitizer: data race bits/vector.tcc:114 in std::vector<LoadResult>::emplace_back(…)
+```
+
+13 条警告按「三要件」归因如下（谁读、谁写、缺什么同步）：
+
+| 坏点 | 谁读（并发访问方 A） | 谁写（并发访问方 B） | 同一内存位置 | 缺的同步 | 报告落点 |
+| --- | --- | --- | --- | --- | --- |
+| ①/③ 完成队列去锁 | 工作线程 T2/T3：`push_back` 内部读旧容量/指针；主线程：`take_all` 搬空与上屏遍历 | 对方工作线程的 `push_back` 写；`take_all` 的指针搬家写；`_M_realloc_insert` 换堆块 | `g_done` 的 vector 内部指针与堆块（`Location is global 'g_done'` / `heap block allocated by thread T3`） | mutex（此處是「搬空」复合操作，atomic 替代不了） | `vector.tcc:114`、`vector.tcc:521–523`、`stl_vector.h:993`、`ch05_task2_race_red.cpp:152` 等共 10 条 |
+| ② 忙等 try_pop | 工作线程 T2/T3：忙等循环裸读 `q_.empty()` 与 `closed_` | 下单线程 `push` 写 deque 内部；`close()` 写 `closed_` | `g_orders` 队列内部节点指针、成员 `closed_` | 谓词版 `cv::wait`——「检查」与「修改」被同一把锁串行化 | `stl_deque.h:273`、`basic_string.h:1072/223`、`ch05_task2_race_red.cpp:62/98` 等共 3 条 |
+
+**绿**：逐条修复回任务 1 的正确写法。修复 diff 一共就 4 处行级改动，其余逐字节一致：
+
+```diff
+--- ch05_task2_race_red.cpp（红）
++++ ch05_task1_async_loader.cpp（绿）
+@@ TaskQueue::try_pop @@
+-    for (;;) {
+-        while (q_.empty() && !closed_) std::this_thread::yield();   // ❌ 无锁忙等
+-        std::lock_guard<std::mutex> lock(m_);
++    std::unique_lock<std::mutex> lock(m_);
++    cv_.wait(lock, [this] { return !q_.empty() || closed_; });      // ✅ 谓词等待：睡到条件成立
++    if (q_.empty()) return std::nullopt;
+@@ DoneQueue::push @@
+-    items_.push_back(std::move(r));                                 // ❌ 无锁写
++    { std::lock_guard<std::mutex> lock(m_);                         // ✅ 锁回来了
++      items_.push_back(std::move(r)); }
+@@ DoneQueue::take_all @@
+-    std::vector<LoadResult> out = std::move(items_);                // ❌ 无锁搬空
++    std::lock_guard<std::mutex> lock(m_);                           // ✅ 检查+搬空收进一个临界区
++    std::vector<LoadResult> out = std::move(items_);
+```
+
+绿色判定口径与实测：**同一场景（10 任务 × 2 工作线程 × 1.5s）、同一 TSan 构建，全程零 `WARNING: ThreadSanitizer`**——
+
+```bash
+g++ -std=c++20 -O1 -g -fsanitize=thread -pthread ch05_task1_async_loader.cpp -o loader_tsan
+{ sleep 1.5; echo q; } | setarch $(uname -m) -R ./loader_tsan          # stderr 零输出
+grep -c "WARNING: ThreadSanitizer" <stderr>                            # → 0
+# 末行照常：关停完成：共 93 帧，帧间隔 min/avg/max = 15.9/16.0/16.1 ms，上屏 10/10（校验和通过 10）
+```
+
+**Windows 本地边界记录**（同一份坏代码，任务 2 第 3 步的「不报」实测）：
+
+| 工具 | 实测结果 | 边界结论 |
+| --- | --- | --- |
+| `cl … /fsanitize=address`（ASan） | 连跑 3 次，全部 `EXIT=0`、零报告（仅 C5072 提示补 `/Zi`，属构建建议） | ASan **不抓数据竞争**——竞争不是内存布局错误（5.10 表格的亲手复现） |
+| `cl … /analyze` | 零并发相关发现 | 静态分析给不出时序结论 |
+| 裸 MSVC 构建（无任何 sanitizer） | 连跑 5 次，全部「正常」上屏 10/10、退出码 0 | **错的代码能跑对一万次**——没有仪器，人眼与概率论都不可靠（5.2 世界观的实测版） |
+
+三行工具能边界结论（任务 2 交付物要求）：TSan 抓数据竞争、只在 WSL2/Linux；ASan 抓内存 UB、不抓竞争；`/analyze` 抓锁纪律与空解引用、抓不到真实时序。TSan 与 ASan 互斥（shadow memory 冲突），分两次构建各司其职。
+
+### 任务 3：引擎并发约定短文档（扩展层 B）
+
+完整 `CONCURRENCY.md` 如下（评分式验收要求每条约定给出「对应代码位置」与「违反时的故障模式」，已并入各节表格）：
+
+````markdown
+# CONCURRENCY.md —— mini_loader 并发约定 v1
+
+适用范围：ch05 任务 1 迷你异步资源加载器；部件并入 P1 渲染器后同样生效。
+修订规则：改约定必须连同对应代码一起改，约定与代码不一致时按事故处理。
+
+## 1. 哪些数据可跨线程
+
+跨线程传递的只有**值类型**：加载任务 `std::string`、加载结果 `LoadResult{name, checksum}`。
+全部经队列**移动**转移所有权，任何线程不持有别线程数据的引用/指针。
+大载荷（像素缓冲）就地 move，不拷贝。
+
+| 违反时故障模式 | 对应代码位置 |
+| --- | --- |
+| 引用跨线程 → 悬垂引用，时序随机崩溃（5.1 悬垂坑） | `TaskQueue::push(T value)` 按值收参是接口契约 |
+
+## 2. 谁拥有
+
+| 对象 | 拥有者 | 生命周期 |
+| --- | --- | --- |
+| 待加载任务 | TaskQueue（队列拥有任务） | 从 push 到 try_pop 取出 |
+| 处理中的任务 | 正在 decode 的工作线程（局部变量持有） | 从取出到交入完成队列 |
+| 已完成结果 | DoneQueue | 从 push 到主线程 take_all 取走 |
+| 已上屏数据 | 主线程独占 | 上屏后即弃 |
+
+| 违反时故障模式 | 对应代码位置 |
+| --- | --- |
+| 两处同时「拥有」同一结果 → 双重释放/读到半成品 | `worker()` 内 `task` 局部持有；`take_all()` 整体 move |
+
+## 3. 谁负责同步
+
+**队列两端各管各，同步责任长在类型里，不散落在调用点**：
+
+| 共享对象 | 同步原语 | 纪律 |
+| --- | --- | --- |
+| `TaskQueue` 内部 | mutex + cv 谓词等待 | 调用方不加锁直接调 push/try_pop/close |
+| `DoneQueue` 内部 | mutex（帧末批量 take_all） | 同上 |
+| `g_shutdown` | `std::atomic<bool>` | 只当「帧循环开关」，不当数据 |
+| 其他一切共享 | **必须先在本表登记原语，才许写代码** | 无登记 = 不许合入 |
+
+| 违反时故障模式 | 对应代码位置 |
+| --- | --- |
+| 绕过接口直接摸成员 → check-then-act 竞争（5.8） | `TaskQueue`/`DoneQueue` 成员全部 private |
+
+## 4. 上屏纪律
+
+**渲染/输出只准主线程触碰。** 工作线程只产出数据、不打印、不碰任何输出 API。
+（控制台版如此，P1 里对应「GL 调用只准主线程」。）
+
+| 违反时故障模式 | 对应代码位置 |
+| --- | --- |
+| 工作线程 printf → 输出交错；GL 调用跨线程 → 上下文崩溃 | `worker()` 全程无 printf；上屏集中在 main 帧循环 |
+
+## 5. 关停协议
+
+固定时序，禁止乱序：
+
+```text
+输入线程：收到 q → TaskQueue::close()（持锁置 closed_ → notify_all）
+          → g_shutdown = true（release）
+工作线程：try_pop 返 nullopt（队列排空且已关停）→ 自然返回（谁也不杀线程）
+主线程  ：观察到 g_shutdown（acquire）→ 退出帧循环
+          → join 输入线程与全部工作线程 → 兜底上屏 → 打印统计 → 退出
+```
+
+谁发 stop：输入线程（close 就是 stop）。谁 join：主线程 join 一切。
+**禁止**：detach、强杀线程、不 join 就让 main 返回。
+
+| 违反时故障模式 | 对应代码位置 |
+| --- | --- |
+| main 先于线程返回 → jthread 析构 terminate / 资源半拆 | `main` 末尾三连 `join()`；兜底 `take_all()` |
+
+## 6. 禁止事项（红线，违反即打回）
+
+1. 不跨线程传引用/`span`/`string_view`（不延长生命周期，接收方无法知道数据还活着）；
+2. 不手写 `lock()/unlock()` 配对（RAII 锁唯一）；
+3. 不用 `detach`；
+4. 持锁不做 IO、不加锁调用会再加锁的函数；
+5. 无测量数据不降内存序（默认 seq_cst；降级唯一路径 acquire/release；relaxed 只给纯统计）；
+6. 并发代码交付即 TSan 闭环：红 → 修复 → 零报告，ASan/TSan 分开跑。
+````
+
+**选做：就绪通知的 atomic release/acquire 版**（完整可编译，`cl /utf-8 /std:c++20 /EHsc /W4` 与 g++ 双工具链零警告）：
+
+```cpp
+// ch05_task3_ready_atomic.cpp —— 实践任务 3（选做）：就绪通知的 atomic release/acquire 版
+// 与 cv 版的分工：cv 版适合「队列语义」的等待-消费（可在关停前排空任意多任务）；
+// atomic 版适合「状态发布」的轻量通知——一次一块数据的完成广播，不携带队列语义。
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <random>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+using namespace std::chrono;
+
+// 结果本体是普通数据（非 atomic）——release/acquire 配对把它的可见性一并捎带
+struct DecodeResult {
+    std::string name;
+    unsigned    checksum = 0;
+    std::vector<unsigned char> bytes;      // 模拟解码出的像素
+};
+
+DecodeResult      g_result;                 // 工作线程的产出（普通变量）
+std::atomic<bool> g_ready{false};           // 发布标志（atomic 的唯一职责）
+
+unsigned checksum(std::string_view name) {
+    unsigned h = 2166136261u;
+    for (char c : name) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+    return h;
+}
+
+void decode_worker() {
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> byte(0x00, 0xFF);
+
+    g_result.name = "tex_boss.png";                    // ① 写数据（普通写）
+    g_result.checksum = checksum(g_result.name);
+    g_result.bytes.assign(256, 0);
+    for (auto& b : g_result.bytes) b = static_cast<unsigned char>(byte(rng));
+
+    g_ready.store(true, std::memory_order_release);    // ② release 发布：① 的一切写入打包可见
+}
+
+int main() {
+    std::thread w(decode_worker);
+    while (!g_ready.load(std::memory_order_acquire))   // ③ acquire 获取：与 ② 配对
+        std::this_thread::yield();
+
+    // ④ ③ 读到 true ⟹ synchronizes-with ⟹ ① happens-before 这里：普通数据安全消费
+    unsigned expect = checksum(g_result.name);
+    std::printf("上屏 %s 校验和=0x%08X 核对%s（首字节=0x%02X，共 %zu 字节）\n",
+                g_result.name.c_str(), g_result.checksum,
+                g_result.checksum == expect ? "通过" : "不一致",
+                g_result.bytes[0], g_result.bytes.size());
+    w.join();
+    return 0;
+}
+```
+
+实测输出：`上屏 tex_boss.png 校验和=0xF34B27B3 核对通过（首字节=0x5F，共 256 字节）`（与任务 1 里同名资源的校验和一致——同一函数同一输入）。
+
+**落笔三句话（检验标准②）**：① 生产者 `store(true, release)` 把此前对 `g_result` 的一切普通写入「打包发布」，消费者 `load(acquire)` 读到 true 即与该 store 建立 synchronizes-with，打包内容全部 happens-before 消费代码——普通缓冲不需要 atomic 也不需要锁；② 但这套配对只能表达「一次发布 → 一次消费」的状态广播，**没有队列的积压、排空与关停语义**，多任务多消费者还是 cv + 队列的地盘；③ 所以 cv 版适合「队列语义」的等待-消费（本任务 1 主线），atomic 版适合「状态发布」的轻量通知（如单缓冲就绪、关停开关）——两者是分工，不是优劣。
 
 ---
 
